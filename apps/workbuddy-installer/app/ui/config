@@ -1,0 +1,16 @@
+{
+    ".url": {
+        "fnwb.workbuddy.main": {
+            "allUsers": false,
+            "control": {
+                "accessPerm": "readonly"
+            },
+            "icon": "images/icon_{0}.png",
+            "port": "8090",
+            "protocol": "http",
+            "title": "WorkBuddy",
+            "type": "iframe",
+            "url": "/"
+        }
+    }
+}
