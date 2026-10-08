@@ -1,0 +1,10 @@
+#!/bin/bash
+# cmd/upgrade_callback — fnOS 生命周期钩子
+# SPDX-License-Identifier: MIT
+#
+# 由 fnOS 应用中心在对应时机调用。
+# 本脚本无需实现额外逻辑，退出 0 表示成功。
+#
+# 如需在特定时机做事（例如清理旧版本、迁移数据），在此添加。
+
+exit 0
