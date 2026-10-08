@@ -4,10 +4,6 @@
 
 一个 fpk 包，**不包含 WorkBuddy 的任何二进制文件**。安装时才从官方地址获取官方 `.deb` 并解包为 fnOS 应用。
 
-```
-fpk（~2MB）──安装──> 从官方镜像下载 deb（367MB）──解包──> /vol1/1000/workbuddy（1.3GB）
-```
-
 ---
 
 ## 这是什么，不是什么
@@ -19,8 +15,6 @@ fpk（~2MB）──安装──> 从官方镜像下载 deb（367MB）──解�
 | ❌ 不是 | WorkBuddy 程序本体 |
 | ❌ 不是 | 官方发布物，与 WorkBuddy 官方无隶属关系 |
 | ❌ 不是 | 重新打包的 WorkBuddy，不修改任何官方代码 |
-
-**为什么这么设计**：把 367MB 的官方 deb 塞进 fpk 意味着二次分发官方软件，有著作权风险。做成安装器则完全规避 —— 仓库里没有一行官方代码，运行时才去官方源取。
 
 ---
 
@@ -37,11 +31,7 @@ fpk（~2MB）──安装──> 从官方镜像下载 deb（367MB）──解�
 
 ### 关于安装过程
 
-fpk 安装时会在 `cmd/install_init` 阶段自动完成：
-
-```
-检测架构 → 从官方源下载 deb → dpkg -x 解包 → 校验 → 拉起服务
-```
+fpk 安装时会在 `cmd/install_init` 阶段自动完成：检测架构 → 从官方源下载 deb → dpkg -x 解包 → 校验 → 拉起服务
 
 全程静默，日志在 `/tmp/workbuddy-installer.log`（也可在应用详情页查看）。
 
@@ -161,7 +151,7 @@ DEB_FILE=/tmp/workbuddy_1.0.0_amd64.deb \
 | | x86_64 | aarch64 |
 |---|---|---|
 | 对应 fpk | `fnwb.workbuddy_1.0.0_x86.fpk` | `fnwb.workbuddy_1.0.0_arm.fpk` |
-| NAS 型号 | 多数 Intel/AMD 飞牛 | 飞牛 OEC 等 ARM 机型 |
+| NAS 型号 | 多数 Intel/AMD 飞牛 |  OEC 等 ARM 机型 |
 
 用 `uname -m` 查看自己的架构：`x86_64` 选 x86，`aarch64` 选 arm。
 
