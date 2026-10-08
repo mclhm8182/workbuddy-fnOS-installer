@@ -1,0 +1,679 @@
+#!/bin/bash
+# cmd/install_init — 安装前钩子：下载官方 deb 并解包
+# SPDX-License-Identifier: MIT
+#
+# 由 fnOS 应用中心在安装前调用。这是整个安装流程的核心：
+#   从官方地址获取 .deb → dpkg -x 解包到存储池 → 生成启动脚本 → 拉起服务
+#
+# 不注册进 dpkg 数据库，避免与官方 deb 的安装/升级/卸载互相破坏。
+#
+# 退出码：0 成功 / 1 失败
+
+CMD_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# shellcheck source=lib/common.sh
+. "$CMD_DIR/lib/common.sh"
+
+# 安装期落盘到存储池（应用注册目录在系统分区，不放大文件）
+#
+# 注意：这里**刻意不与手工安装目录同名**。
+# 若指向 /vol1/1000/workbuddy，dpkg -x 会覆盖用户已有的安装，
+# 且安装前的"停止服务"会中断正在运行的实例。
+# 故默认使用独立目录，检测到目标已存在时也会停手询问。
+APP_DATA="${WORKBUDDY_APP_DIR:-/vol1/1000/app_workbuddy}"
+
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/workbuddy-installer.log}"
+REQUIRE_SPACE_MB=2600      # deb 约 429MB + 解包约 1.3GB，留余量
+
+log() { printf '%s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+
+# ---------------------------------------------------------------- 参数
+#
+# 支持通过环境变量预设：
+#   DEB_URL         指定下载地址（跳过官方接口查询）
+#   DEB_FILE        使用本地 deb 路径（0 流量安装）
+#
+# 版本号默认由官方接口动态获取，无需硬编码 —— 官方构建号每次发版都会变。
+
+DEB_URL="${DEB_URL:-}"
+DEB_FILE="${DEB_FILE:-}"
+# 记录安装后写入的版本，用于下次判断是否需要升级
+VERSION=""
+
+# ---------------------------------------------------------------- 前置检查
+
+log "=== WorkBuddy 安装开始 ==="
+log "架构: $(uname -m)"
+log "安装目标: $APP_DATA"
+
+# ---------------------------------------------------------------- 冲突检测
+#
+# 冲突处理原则：
+#   1. 目标目录已有文件 → 中止（这是真风险，可能覆盖未知的同路径安装）
+#   2. 检测到其它目录已有 WorkBuddy → **仅提示，不阻断**
+#      fnOS 通过应用中心执行本脚本，属非交互环境，无法回答 y/n；
+#      若在此询问会导致普通用户永远装不上。故只告知影响后继续。
+#   3. 端口被其它实例占用 → 中止（避免误停用户正在用的服务）
+
+LEGACY_DIR="/vol1/1000/workbuddy"
+
+if [ -n "$(ls -A "$APP_DATA" 2>/dev/null)" ]; then
+    die "目标目录已存在且非空：$APP_DATA
+为避免覆盖已有安装，已中止。
+若确认要覆盖，请先手动清空该目录，或设置 WORKBUDDY_APP_DIR 指向新路径。"
+fi
+
+if [ -n "$(ls -A "$LEGACY_DIR" 2>/dev/null)" ]; then
+    info "检测到另一个 WorkBuddy 安装：$LEGACY_DIR"
+    hint "本安装器不会改动它，程序将装到：$APP_DATA"
+    hint "两者会共存（占用双份空间），只有本安装器管理的副本会开机自启。"
+    hint "若你只想用原来那份，可直接卸载本包。"
+fi
+
+ARCH=$(detect_arch)
+[ -n "$ARCH" ] || die "不支持的 CPU 架构：$(uname -m)
+本安装器仅支持 x86_64 与 aarch64。"
+
+log "deb 架构: $ARCH"
+
+check_deps dpkg awk sed grep df
+
+# ---------------------------------------------------------------- 官方更新接口
+#
+# 从腾讯官方接口取得最新版地址。返回形如：
+#   {"version":"5.5.6.38337834",
+#    "url":"https://download.codebuddy.cn/workbuddy/saas/linux-x64-deb/....deb",
+#    "productVersion":"5.5.6.38337834"}
+#
+# **不硬编码 URL** —— 官方构建号（如 5f969292）每次发版都变，
+# 动态取址才不会失效。
+#
+# 注意：接口返回的 sha256hash 与实际文件不符（社区反馈），
+# 故本安装器不使用该字段做校验，只在下载后自行记录。
+
+resolve_official_url() {
+    chan=$(platform_channel "$ARCH")
+    [ -n "$chan" ] || return 1
+    log "查询官方更新接口: $chan"
+
+    api="${UPDATE_API}${chan}"
+    if have_cmd curl; then
+        json=$(curl -fsL --connect-timeout 15 --max-time 40 "$api" 2>/dev/null) || return 1
+    elif have_cmd wget; then
+        json=$(wget -qO- --timeout=40 "$api" 2>/dev/null) || return 1
+    else
+        die "系统缺少 curl 或 wget"
+    fi
+
+    # 从 JSON 中取 url 与 productVersion（不依赖 jq，用 sed 提取）
+    _url=$(printf '%s' "$json" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    _ver=$(printf '%s' "$json" | sed -n 's/.*"productVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$_url" ] || return 1
+    OFFICIAL_URL="$_url"
+    OFFICIAL_VERSION="$_ver"
+    return 0
+}
+
+# ------------------------------------------------------------ 幂等检查
+#
+# 记录上次安装的版本（我们写入 .installed_version），
+# 与官方接口返回的最新版本对比，一致则跳过下载。
+# 注意：目录名里的版本号（/opt/WorkBuddy）无法可靠提取，
+# 故以自己写入的标记文件为准。
+
+installed_version() {
+    [ -r "$APP_DATA/.installed_version" ] || return 1
+    cat "$APP_DATA/.installed_version" 2>/dev/null | tr -d '[:space:]'
+}
+
+CUR_INSTALLED=$(installed_version || true)
+
+# 需要先取到官方版本才能判断，故在未指定 DEB_FILE 时提前查询
+if [ -z "$DEB_FILE" ] && [ -z "$DEB_URL" ]; then
+    step "查询官方最新版本"
+    if resolve_official_url; then
+        VERSION="${OFFICIAL_VERSION:-}"
+        ok "官方最新版：${VERSION:-未知}"
+        log "下载地址: $OFFICIAL_URL"
+    else
+        warn "无法查询官方更新接口"
+        VERSION=""
+    fi
+fi
+
+if [ -n "$VERSION" ] && [ -n "$CUR_INSTALLED" ] && [ "$CUR_INSTALLED" = "$VERSION" ] && [ -z "$DEB_FILE" ] && [ -z "$DEB_URL" ]; then
+    ok "已是最新版本 $VERSION，跳过安装"
+    INSTALL_SKIP=1
+else
+    INSTALL_SKIP=0
+    [ -n "$CUR_INSTALLED" ] && info "升级：$CUR_INSTALLED -> ${VERSION:-最新}"
+
+    # ------------------------------------------------------------ 取得 deb
+    #
+    # 顺序很重要：**先下载成功，再停服务**。
+    # 否则下载一失败，用户正在运行的实例已经被停掉，白挨一刀。
+    step "获取安装包"
+
+    # deb 临时文件位置
+    #
+    # 不能固定用 /tmp：ARM 机型（如飞牛 OEC）的 /tmp 是 tmpfs（内存盘），
+    # 实测仅 976MB，装不下 400MB 的 deb；其/ 系统分区也只有 2.7G 可用。
+    # 故优先落在 APP_DATA 同级的存储池上（那里空间充足且属同一卷）。
+    TMP_BASE="$(dirname "$APP_DATA")"
+    TMP_DEB="$TMP_BASE/.workbuddy-dl-$(rand_suffix).deb"
+    cleanup() { [ -n "${TMP_DEB:-}" ] && [ -f "$TMP_DEB" ] && rm -f "$TMP_DEB"; return 0; }
+    trap cleanup EXIT INT TERM
+
+    fetch_deb() {
+        dest="$1"
+        if [ -n "$DEB_FILE" ]; then
+            [ -r "$DEB_FILE" ] || die "无法读取本地 deb：$DEB_FILE"
+            log "使用本地 deb: $DEB_FILE"
+            info "使用本地 deb（0 流量）"
+            cp -f "$DEB_FILE" "$dest" || die "复制 deb 失败"
+            return 0
+        fi
+
+        # 组装候选地址列表：用户指定优先，其次官方接口
+        URLS=""
+        if [ -n "$DEB_URL" ]; then
+            URLS="$DEB_URL"
+        else
+            if resolve_official_url; then
+                info "官方接口返回版本：${OFFICIAL_VERSION:-未知}"
+                log "官方地址: $OFFICIAL_URL"
+                URLS="$OFFICIAL_URL"
+            else
+                warn "官方更新接口查询失败或返回格式异常"
+                die "无法获取官方下载地址。
+可手动指定：DEB_URL=https://.../xxx.deb
+或用本地包：DEB_FILE=/path/to/workbuddy.deb"
+            fi
+        fi
+
+        # 注意两个坑：
+        #  a)不能用 `echo ... | while read`——管道开子 shell，循环里的
+        #     return 只退出子 shell，外层拿不到结果。故用 here-string。
+        #  b)循环体内不能用 return 来表示"失败后继续下一个"——那会直接
+        #     退出整个函数，后续源永远轮不到。必须让循环自然走完。
+        while IFS= read -r url; do
+            [ -n "$url" ] || continue
+            log "尝试下载: $url"
+            info "下载：$url"
+
+            if have_cmd curl; then
+                if curl -fL --connect-timeout 20 --retry 2 \
+                     -o "$dest" "$url"; then
+                    return 0        # 仅成功时才 return
+                fi
+            elif have_cmd wget; then
+                if wget --timeout=30 --tries=2 -O "$dest" "$url"; then
+                    return 0
+                fi
+            else
+                die "系统缺少 curl 或 wget"
+            fi
+
+            warn "下载失败"
+            rm -f "$dest" 2>/dev/null || true
+        done <<<"$URLS"
+
+        return 1
+    }
+
+    if [ -z "$DEB_FILE" ]; then
+        # 检查 APP_DATA 所在卷（不是硬编码 /vol1—— 各机器挂载点可能不同）
+        _chk="$(dirname "$APP_DATA")"
+        [ -d "$_chk" ] || _chk="/tmp"
+        require_space_mb "$REQUIRE_SPACE_MB" "$_chk"
+    fi
+
+    if ! fetch_deb "$TMP_DEB"; then
+        die "下载失败。
+可改用本地安装：设置 DEB_FILE=/path/to/workbuddy.deb
+或手动指定官方地址：设置 DEB_URL=<地址>
+官方地址可从该接口获取（浏览器直接打开即可看到 JSON）：
+  ${UPDATE_API}workbuddy-linux-x64-deb
+  ${UPDATE_API}workbuddy-linux-arm64-deb"
+    fi
+
+    [ -s "$TMP_DEB" ] || die "下载得到的 deb 为空"
+    ok "安装包就绪（$(human_size "$(wc -c <"$TMP_DEB")")）"
+    log "deb 大小: $(wc -c <"$TMP_DEB") bytes"
+
+    # ------------------------------------------------------------ 停服务
+    #
+    # 到这里 deb 已就位，才可以安全地停服务。
+    #
+    # 两种情况：
+    #  a) 占用者是本安装器管理的实例 → 正常停掉再升级
+    #  b) 占用者是手工安装的实例 → 也停掉，因为两者抢同一个端口无法共存。
+    #     停之前告知用户；其数据目录不会被删除，日后可重新启动。
+    if is_running; then
+        pid=$(port_owner)
+        cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+        if echo "$cmdline" | grep -q "$APP_DATA"; then
+            step "停止本安装器管理的服务"
+        else
+            warn "端口 $APP_PORT 被另一个 WorkBuddy 实例占用（PID $pid）"
+            hint "该实例将暂时停止，其数据目录不会被删除。"
+            hint "如需恢复，可在原目录下重新执行 login_runner.sh。"
+        fi
+        stop_service || warn "停止服务返回异常，继续"
+    fi
+
+# ---------------------------------------------------------------- 兜底脚本
+#
+# 官方 deb 是标准 Electron 桌面应用包（安装到 /opt/WorkBuddy/），
+# 不含 start.sh。我们在存储池解包后，需自行生成启动脚本。
+#
+# Electron 包的典型结构：
+#
+# 关键：真正能在NAS 后台常驻提供服务的是**内置 CLI 网关模式**，
+#   入口：<appdir>/resources/app.asar.unpacked/cli/bin/codebuddy
+#   参数：--serve --host 0.0.0.0 --port <PORT>
+# 同目录下还有 resources/runtime/node/bin（自带 Node 运行时，需加入 PATH）。
+#
+# 注意：<appdir>/workbuddy 是 Electron 桌面程序，无显示环境下无法运行，
+#不要用它 —— 这是本安装器早前版本失败的原因。
+#
+# 解包后的目录结构（实测 1.1）：
+#   opt/apps/<appname>/                       或   opt/<AppName>/
+#     resources/app.asar.unpacked/cli/bin/codebuddy
+#     resources/runtime/node/bin/node
+#
+# bash 是顺序执行的，函数必须在调用点之前定义，故放在此处。
+
+_write_fallback_scripts() {
+    _dir="$1"
+
+    # --- 定位 app 目录（含 cli/bin/codebuddy 的那一层）---
+    _appdir=""
+    for pat in \
+        "$_dir"/root/opt/apps/* \
+        "$_dir"/opt/apps/* \
+        "$_dir"/root/opt/* \
+        "$_dir"/opt/*; do
+        [ -d "$pat" ] || continue
+        if [ -x "$pat/resources/app.asar.unpacked/cli/bin/codebuddy" ]; then
+            _appdir="$pat"
+            break
+        fi
+    done
+
+    # 兜底：全局搜索该入口文件
+    if [ -z "$_appdir" ]; then
+        _cli=$(find "$_dir" -type f -path '*resources/app.asar.unpacked/cli/bin/codebuddy' \
+               2>/dev/null | head -1)
+        [ -n "$_cli" ] && _appdir="${_cli%/resources/app.asar.unpacked/cli/bin/codebuddy}"
+    fi
+
+    if [ -z "$_appdir" ]; then
+        err "未能在 $_dir 中定位 WorkBuddy CLI 入口"
+        log "（期望路径 */resources/app.asar.unpacked/cli/bin/codebuddy）"
+        log "解包顶层："
+        log "$(ls -la "$_dir" 2>/dev/null)"
+        log "opt 结构："
+        log "$(ls -la "$_dir/opt" 2>/dev/null)"
+        log "root 结构："
+        log "$(ls -la "$_dir/root" 2>/dev/null)"
+        return 1
+    fi
+
+    # Node 运行时目录（若存在则加入 PATH）
+    _nodedir="$_appdir/resources/runtime/node/bin"
+
+    info "定位到 CLI 入口：$_appdir"
+    log "app 目录: $_appdir"
+
+    if [ ! -x "$_nodedir/node" ]; then
+        warn "未找到内置 Node 运行时（$_nodedir/node），将依赖系统 node"
+    fi
+
+    # --- 生成启动脚本 ---
+    #
+    # 逻辑与用户在 1.1 上验证可用的方案一致：
+    #   HOME/TMPDIR 指向安装目录（避免污染系统家目录）
+    #   PATH 加入自带 node
+    #   NODE_OPTIONS 限制 V8 堆预算，配合 cgroup 防止 OOM
+    #
+    # 访问认证（重点）：
+    #   CodeBuddy 网关**没有"首次设置密码"的流程**，它只认"用终端打印的密码登录"，
+    #   或在settings.json 里设 gateway.auth。因此给用户两个选择：
+    #
+    #   AUTH_MODE=password -> 随机生成密码存ACCESS_PASS，入口 url 带 ?password=
+    #   AUTH_MODE=none     -> 不需要密码，打开即用（默认）
+    #
+    #   用 AUTH_MODE 文件控制，用户可随时改并重启，无需重装：
+    #       echo password > $BASE/AUTH_MODE   开启
+    #       echo none     > $BASE/AUTH_MODE   关闭
+    cat >"$_dir/start.sh" <<EOS
+#!/bin/bash
+# WorkBuddy 服务启动脚本（由第三方安装器生成，非官方文件）
+# 使用官方内置 CLI 的网关模式提供服务，无需图形环境。
+
+BASE="\$(cd "\$(dirname "\$0")" && pwd)"
+APPDIR="$_appdir"
+
+# 数据与临时目录就地放置，避免污染系统目录
+export HOME="\$BASE/home"
+export TMPDIR="\$BASE/tmp"
+mkdir -p "\$HOME" "\$TMPDIR"
+
+# 使用官方自带的 Node 运行时
+[ -d "$_nodedir" ] && export PATH="$_nodedir:\$PATH"
+
+# ---------------------------------------------------------------------
+# 访问认证
+#
+#   AUTH_MODE=password  启用密码认证，密码见ACCESS_PASS 文件
+#   AUTH_MODE=none      不需要密码，局域网/Tailnet 内可直接访问（默认）
+#
+# 需要密码时切换（重启后生效）：
+#   echo password > \$BASE/AUTH_MODE
+#   cat \$BASE/ACCESS_PASS
+# ---------------------------------------------------------------------
+AUTH_MODE="\$(cat "\$BASE/AUTH_MODE" 2>/dev/null || echo none)"
+
+if [ "\$AUTH_MODE" = "password" ]; then
+    ACCESS_PASS_FILE="\$BASE/ACCESS_PASS"
+    if [ ! -s "\$ACCESS_PASS_FILE" ]; then
+        head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16 > "\$ACCESS_PASS_FILE"
+        chmod 600 "\$ACCESS_PASS_FILE"
+    fi
+    export CODEBUDDY_GATEWAY_AUTH=password
+    export CODEBUDDY_GATEWAY_PASSWORD="\$(cat "\$ACCESS_PASS_FILE")"
+else
+    export CODEBUDDY_GATEWAY_AUTH=none
+fi
+
+# ---------------------------------------------------------------------
+# 内存预算
+#
+# V8 堆上限需按机器实际内存自适应：
+#   2GB 机器（如飞牛 OEC）→ 768MB，避免 V8 把系统内存吃光导致 OOM
+#   8GB 以上            → 1024MB
+#   16GB 以上           → 1536MB
+#
+# Node 自身开销约在堆之外再占 100-200MB，故总占用约为堆上限的 1.3 倍。
+# 取得总内存后按比例推算，可用 MEM_TOTAL_MB 覆盖。
+# ---------------------------------------------------------------------
+_mem_total_mb() {
+    if [ -n "${MEM_TOTAL_MB:-}" ]; then
+        echo "$MEM_TOTAL_MB"; return
+    fi
+    _t=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    [ -n "$_t" ] || _t=2048
+    echo "$_t"
+}
+
+_total=$(_mem_total_mb)
+if [ "$_total" -lt 3072 ]; then
+    HEAP_MB=768
+elif [ "$_total" -lt 12288 ]; then
+    HEAP_MB=1024
+else
+    HEAP_MB=1536
+fi
+
+export NODE_OPTIONS="--max-old-space-size=\$HEAP_MB"
+echo "WorkBuddy: 机器内存 \${_total}MB，V8 堆上限 \${HEAP_MB}MB"
+
+exec "\$APPDIR/resources/app.asar.unpacked/cli/bin/codebuddy" \\
+    --serve --host 0.0.0.0 --port ${APP_PORT}
+EOS
+    chmod +x "$_dir/start.sh" || return 1
+
+    # 默认不启用密码（开箱即用）
+    printf 'none\n' >"$_dir/AUTH_MODE"
+
+    # --- 生成开机自启用的包装脚本 ---
+    cat >"$_dir/login_runner.sh" <<EOS
+#!/bin/sh
+# WorkBuddy 自启包装脚本（由第三方安装器生成，非官方文件）
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+nohup "\$DIR/start.sh" >>"\$DIR/run.log" 2>&1 &
+EOS
+    chmod +x "$_dir/login_runner.sh" || return 1
+
+    # --- 供 fnOS main start 调用的入口 ---
+    ln -sf start.sh "$_dir/run.sh" 2>/dev/null || true
+
+    log "已生成启动脚本"
+    hint "CLI 入口：$_appdir"
+    return 0
+}
+
+# 确保认证相关文件存在
+#
+# 默认 AUTH_MODE=none（无需密码，打开即用）。
+# 用户可随时改为 password 以启用访问认证：
+#     echo password > /vol1/1000/app_workbuddy/AUTH_MODE
+#     cat /vol1/1000/app_workbuddy/ACCESS_PASS
+_ensure_auth_files() {
+    _dir="$1"
+    # 认证模式：默认 none
+    [ -f "$_dir/AUTH_MODE" ] || printf 'none\n' >"$_dir/AUTH_MODE"
+
+    # 若已启用密码但密码文件缺失，补生成一个
+    if [ "$(cat "$_dir/AUTH_MODE" 2>/dev/null || echo none)" = "password" ]; then
+        if [ ! -s "$_dir/ACCESS_PASS" ]; then
+            head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16 \
+                >"$_dir/ACCESS_PASS"
+            chmod 600 "$_dir/ACCESS_PASS"
+            info "已生成访问密码：$(cat "$_dir/ACCESS_PASS")"
+        fi
+    fi
+    return 0
+}
+
+# 写入 fnOS 桌面入口配置
+#
+# 关键点：网关开启了密码认证，iframe 请求若不带凭证会返回空白页/黑屏。
+# 因此 url 必须带上 ?password=<网关密码>。
+#
+# 路径说明（fnOS 实测）：
+#   fpk 内是 app/ui/config，但 fnOS 应用中心解包 app.tgz 后，
+#   ui/ 与 config/ **直接落在应用注册目录顶层**，即：
+#     /usr/local/apps/@appcenter/<appid>/ui/config
+#   不是一个 app/ui/ 子目录。各版本结构可能有差异，故依次探测。
+_write_desktop_entry() {
+    _datadir="$1"
+
+    # 无密码模式（默认）：url 不带参数，打开即用
+    if [ "$(cat "$_datadir/AUTH_MODE" 2>/dev/null || echo none)" != "password" ]; then
+        _pw=""
+    else
+        _pw=$(cat "$_datadir/ACCESS_PASS" 2>/dev/null || echo "")
+    fi
+
+    # 候选位置：应用注册目录优先（fnOS 实际读取处），其次旧结构
+    _cands="
+$APP_DIR/ui/config
+$APP_DIR/app/ui/config
+$_datadir/app/ui/config
+$_datadir/ui/config
+"
+
+    _target=""
+    for c in $_cands; do
+        if [ -d "$(dirname "$c")" ]; then
+            _target="$c"
+            break
+        fi
+    done
+
+    # 都没找到时，在应用注册目录下创建 ui/（首次安装可能如此）
+    if [ -z "$_target" ] && [ -d "$APP_DIR" ]; then
+        mkdir -p "$APP_DIR/ui/images" 2>/dev/null || true
+        if [ -d "$APP_DIR/ui" ]; then
+            _target="$APP_DIR/ui/config"
+        fi
+    fi
+
+    if [ -z "$_target" ]; then
+        warn "未找到桌面入口配置目录，跳过"
+        log "尝试过的路径：$_cands"
+        log "APP_DIR=$APP_DIR是否存在：$([ -d "$APP_DIR" ] && echo yes || echo no)"
+        return 1
+    fi
+
+    cat >"$_target" <<EOC
+{
+    ".url": {
+        "${APP_ID}.main": {
+            "allUsers": false,
+            "control": {
+                "accessPerm": "readonly"
+            },
+            "icon": "images/icon_{0}.png",
+            "port": "${APP_PORT}",
+            "protocol": "http",
+            "title": "WorkBuddy",
+            "type": "iframe",
+            "url": "/${_pw:+?password=${_pw}}"
+        }
+    }
+}
+EOC
+    log "已写入桌面入口配置：$_target"
+    log "url 含网关密码，已带 control.accessPerm"
+    return 0
+}
+
+    # ------------------------------------------------------------ 解包
+    step "解包到 $APP_DATA"
+    mkdir -p "$APP_DATA" || die "创建安装目录失败：$APP_DATA"
+    dpkg -x "$TMP_DEB" "$APP_DATA" || die "解包失败，安装包可能已损坏"
+    ok "解包完成"
+
+    # ------------------------------------------------------------ 启动脚本
+    #
+    # 官方 deb 内**不含** start.sh —— 它是标准的 Electron 桌面应用包
+    # （安装到 /opt/WorkBuddy/，由 postinst 注册 /usr/bin/workbuddy）。
+    # 但我们要的是在 fnOS 上跑一个常驻 Web 服务供 iframe 访问，
+    # 所以这里自行生成启动脚本，直接拉起 Electron 主进程并监听 8090。
+    step "准备启动脚本"
+    if [ -f "$APP_DATA/start.sh" ]; then
+        chmod +x "$APP_DATA/start.sh" 2>/dev/null || true
+        ok "使用 deb 自带的启动脚本"
+    else
+        _write_fallback_scripts "$APP_DATA" \
+            || die "无法生成启动脚本：未能定位 WorkBuddy 程序入口
+请查看 $LOG_FILE 中的日志。"
+    fi
+
+    # ------------------------------------------------------------ 校验
+    step "校验安装结果"
+    [ -n "$(ls -A "$APP_DATA" 2>/dev/null)" ] || die "解包后目录为空，安装未成功"
+    if [ ! -f "$APP_DATA/start.sh" ]; then
+        die "未生成启动脚本，无法拉起服务"
+    fi
+    [ -x "$APP_DATA/start.sh" ] || chmod +x "$APP_DATA/start.sh" 2>/dev/null || true
+    USED=$(du -sm "$APP_DATA" 2>/dev/null | awk '{print $1}')
+    ok "安装完成，占用约 ${USED}MB"
+    log "安装后占用: ${USED}MB"
+
+    # 记录版本，供下次升级判断
+    printf '%s\n' "${VERSION:-unknown}" >"$APP_DATA/.installed_version"
+    ok "已记录版本：${VERSION:-unknown}"
+
+    # ------------------------------------------------------------ 清deb
+    cleanup
+    TMP_DEB=""
+fi
+
+# ---------------------------------------------------------------- 桌面入口
+#
+# 无论本次是全新安装、升级还是"已是最新版本跳过"，都要确保
+# 桌面入口的 url 带着正确的网关密码 —— 这是黑屏的根因所在。
+# 放在此处可覆盖所有分支。
+if [ -f "$APP_DATA/.gateway_pass" ] || [ -f "$APP_DATA/start.sh" ]; then
+    step "配置桌面入口"
+    _ensure_auth_files "$APP_DATA"
+    _write_desktop_entry "$APP_DATA" \
+        || warn "桌面入口配置未更新；若打开是黑屏，请手动把应用设置中的 url 改为 /?password=<密码>"
+fi
+
+# ---------------------------------------------------------------- 拉起服务
+#
+# 注意两个实测得出的关键点：
+#
+# 1. 必须用 setsid 彻底脱离会话。经sudo 启动的子进程会随 sudo 会话结束
+#    而被 SIGHUP 杀掉，表现为"刚启动就没了"。
+#
+# 2. 端口检测必须确认监听者是**本安装器自己的进程**。
+#    若 8090 已被其它WorkBuddy 实例占用（如用户手工安装的那份），
+#    光看"端口有响应"会误报成功，而桌面入口实际指向的是别人的服务，
+#    密码对不上 → 用户看到黑屏。
+
+step "启动服务"
+
+# 停掉占用同端口的其它实例（它们抢同一个端口无法共存）
+if is_running; then
+    pid=$(port_owner)
+    cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    if ! echo "$cmdline" | grep -q "$APP_DATA"; then
+        warn "端口 ${APP_PORT} 被其它 WorkBuddy 实例占用（PID $pid）"
+        warn "该实例将被停止，其数据目录不会被删除。"
+        stop_service || warn "停止占用进程返回异常"
+        sleep 2
+    fi
+fi
+
+# setsid + nohup：脱离当前会话，避免被父进程退出时的信号带走
+if setsid nohup "$APP_DATA/start.sh" >"$APP_DATA/run.log" 2>&1 </dev/null &
+then
+    # 给它时间起来
+    i=0
+    while [ $i -lt 40 ]; do
+        if is_running; then break; fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    # 校验监听者确实是本实例
+    pid=$(port_owner)
+    if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ]; then
+        cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    else
+        cmdline=""
+    fi
+    if echo "$cmdline" | grep -q "$APP_DATA"; then
+        ok "WorkBuddy 已运行：端口 ${APP_PORT}（PID $pid）"
+        log "=== 安装成功 ==="
+    elif [ -n "$pid" ]; then
+        warn "端口 ${APP_PORT} 被其它进程占用（PID $pid），本实例未能启动"
+        warn "查看日志：tail -20 $APP_DATA/run.log"
+        log "=== 安装完成（服务冲突）==="
+    else
+        warn "服务已拉起但端口 ${APP_PORT} 尚未监听"
+        log "查看日志：tail -20 $APP_DATA/run.log"
+        log "=== 安装完成（服务待检查）==="
+    fi
+else
+    warn "启动失败"
+    log "查看日志：tail -20 $APP_DATA/run.log"
+fi
+
+log "安装目录: $APP_DATA"
+log "访问地址: http://<NAS地址>:${APP_PORT}"
+log "网关密码: $(cat "$APP_DATA/.gateway_pass" 2>/dev/null || echo '(见 .gateway_pass)')"
+
+# ---------------------------------------------------------------- 收尾
+
+cat <<EOF
+
+$(ok "WorkBuddy 安装完成")
+
+  访问地址：http://<你的NAS地址>:${APP_PORT}
+  程序目录：$APP_DATA
+  访问密码：$(cat "$APP_DATA/.gateway_pass" 2>/dev/null || echo '见 .gateway_pass')
+
+  桌面图标已自动配置好密码，直接点击即可访问。
+  端口 ${APP_PORT} 对局域网 / Tailnet 内所有设备开放，
+  密码是唯一防护，请勿泄露。
+
+EOF
+
+exit 0
