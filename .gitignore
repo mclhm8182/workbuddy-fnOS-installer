@@ -1,0 +1,11 @@
+# 构建产物
+dist/
+
+# fnpack 工具（不随仓库分发）
+.fnpack/
+
+# 本地下载的 deb，绝不入库
+*.deb
+
+# macOS
+.DS_Store
