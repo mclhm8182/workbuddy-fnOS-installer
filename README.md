@@ -4,9 +4,8 @@
 
 一个 fpk 包，**不包含 WorkBuddy 的任何二进制文件**。安装时才从官方地址获取官方 `.deb` 并解包为 fnOS 应用。
 
-```
 fpk（~42KB）──安装──> 从官方源下载 deb（~400MB）──解包──> /vol1/1000/app_workbuddy
-```
+
 
 简体中文 | [English](README_EN.md)
 
@@ -39,11 +38,7 @@ fpk（~42KB）──安装──> 从官方源下载 deb（~400MB）──解包
 
 ### 关于安装过程
 
-fpk 安装时会在 `cmd/install_init` 阶段自动完成：
-
-```
-检测架构 → 查询官方接口 → 下载 deb → dpkg -x 解包 → 校验 → 拉起服务
-```
+fpk 安装时会在 `cmd/install_init` 阶段自动完成：检测架构 → 查询官方接口 → 下载 deb → dpkg -x 解包 → 校验 → 拉起服务
 
 全程静默。日志在 `/var/log/apps/fnwb.workbuddy.log`。
 
