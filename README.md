@@ -4,6 +4,12 @@
 
 一个 fpk 包，**不包含 WorkBuddy 的任何二进制文件**。安装时才从官方地址获取官方 `.deb` 并解包为 fnOS 应用。
 
+```
+fpk（~42KB）──安装──> 从官方源下载 deb（~400MB）──解包──> /vol1/1000/app_workbuddy
+```
+
+简体中文 | [English](README_EN.md)
+
 ---
 
 ## 这是什么，不是什么
@@ -11,10 +17,12 @@
 | | |
 |---|---|
 | ✅ 是 | 一个**安装器** —— 下载、解包、注册、启动、卸载，一条龙 |
-| ✅ 是 | 约 2MB 的小包，含图标 + 脚本 + manifest |
+| ✅ 是 | 约 42KB 的小包，含图标 + 脚本 + manifest |
 | ❌ 不是 | WorkBuddy 程序本体 |
 | ❌ 不是 | 官方发布物，与 WorkBuddy 官方无隶属关系 |
 | ❌ 不是 | 重新打包的 WorkBuddy，不修改任何官方代码 |
+
+**为什么这么设计**：把约 400MB 的官方 deb 塞进 fpk 意味着二次分发官方软件，有著作权风险。做成安装器则完全规避 —— 仓库里没有一行官方代码，运行时才去官方源取。
 
 ---
 
@@ -27,13 +35,17 @@
 3. 上传 fpk，确认安装位置为「系统分区」
 4. 装完后桌面出现 WorkBuddy 图标，点击访问
 
-安装过程无需任何输入。首次打开时按页面引导**设置你自己的访问密码**。
+安装过程无需任何输入。**默认构建不需要密码**，点桌面图标直接进 —— 详见[访问控制](#访问控制)。
 
 ### 关于安装过程
 
-fpk 安装时会在 `cmd/install_init` 阶段自动完成：检测架构 → 从官方源下载 deb → dpkg -x 解包 → 校验 → 拉起服务
+fpk 安装时会在 `cmd/install_init` 阶段自动完成：
 
-全程静默，日志在 `/tmp/workbuddy-installer.log`（也可在应用详情页查看）。
+```
+检测架构 → 查询官方接口 → 下载 deb → dpkg -x 解包 → 校验 → 拉起服务
+```
+
+全程静默。日志在 `/var/log/apps/fnwb.workbuddy.log`。
 
 **自定义安装行为** —— 如需跳过自动下载或换源，可在安装前设置环境变量：
 
@@ -89,23 +101,30 @@ sudo sh -c 'cd /vol1/1000/app_workbuddy && setsid ./start.sh > run.log 2>&1 < /d
 
 fnOS 自身的登录**不能替代**这个密码 —— 桌面图标只是 iframe 容器，8090 端口本身是敞开的。
 
+> **关于上游网关**：CodeBuddy 网关**没有"首次运行设置密码"的流程**。它只认三种方式：服务启动时打印在终端的密码、URL 参数 `?password=xxx`、或用 `gateway.auth: "none"` 关闭认证。
+> 正因如此本安装器默认不启用密码、另行提供开关，而不是假装存在一个首次设密码的向导。
+> 启用密码后，桌面入口会自动带上密码参数，点击即可直接进入。
+
 ## 卸载
 
 在 fnOS 应用中心直接卸载即可。
 
-**默认行为**：移除应用注册、桌面图标和启动入口，**保留程序数据**（`/vol1/1000/workbuddy`），便于日后重新启用。
+**默认行为**：移除应用注册、桌面图标和启动入口，**保留程序数据**（`/vol1/1000/app_workbuddy`），便于日后重新启用。
 
-**彻底清理**：如需连程序数据一起删除（不可逆），手动执行：
+**彻底清理**（不可逆），手动执行：
 
 ```bash
 # 先停服务
-sudo /usr/local/apps/@appcenter/fnwb.workbuddy/cmd/main stop
+sudo pkill -f 'app_workbuddy.*codebuddy'
 
 # 确认路径后再删
 sudo rm -rf /vol1/1000/app_workbuddy
 ```
 
 删前建议确认目录路径无误 —— 该目录下含聊天记录与配置，删除后无法恢复。
+
+> 若删除时提示 `Permission denied`，那是 fnOS 的 ACL 所致，用：
+> `sudo setfacl -R -m u:fnwb.workbuddy:rwx /vol1/1000/app_workbuddy` 先放开权限再删。
 
 ---
 
@@ -114,16 +133,18 @@ sudo rm -rf /vol1/1000/app_workbuddy
 **桌面点击无反应 / 一直转圈**
 
 ```bash
-# 看服务是否在跑（exit 0=运行中，exit 3=未运行）
-sudo /usr/local/apps/@appcenter/fnwb.workbuddy/cmd/main status
-
-# 端口占用
+# 端口是否在监听
 ss -lntp | grep 8090
 
-# 安装日志
-cat /tmp/workbuddy-installer.log
-cat /var/apps/fnwb.workbuddy/info.log
+# 应用日志
+sudo tail -40 /var/log/apps/fnwb.workbuddy.log
+
+# 服务运行日志
+sudo tail -40 /vol1/1000/app_workbuddy/run.log
 ```
+
+> 注意：fnOS 安装完成后会把 `cmd/` 挪到 `/var/apps/fnwb.workbuddy/cmd/`，
+> 所以 `/usr/local/apps/@appcenter/fnwb.workbuddy/cmd/main` 在装完后**不存在**，请用上面的命令。
 
 **提示「8090 端口被占用」**
 
@@ -131,18 +152,19 @@ cat /var/apps/fnwb.workbuddy/info.log
 
 **下载失败**
 
-安装器会在两个官方源之间自动回退。都不行的话，先在电脑上下载 deb，拷到 NAS，再设`DEB_FILE` 指向它。
+先在电脑上下载 deb，拷到 NAS，再设 `DEB_FILE` 指向它：
 
 ```bash
-scp workbuddy_1.0.0_amd64.deb Tom@<NAS_IP>:/tmp/
+scp workbuddy_5.4.5_amd64.deb Tom@<NAS_IP>:/tmp/
+
 # 然后在应用中心重新安装，或手动：
-DEB_FILE=/tmp/workbuddy_1.0.0_amd64.deb \
+sudo env DEB_FILE=/tmp/workbuddy_5.4.5_amd64.deb \
   /usr/local/apps/@appcenter/fnwb.workbuddy/cmd/install_init
 ```
 
-**ARM 机器提示 404**
+**重启后服务没了**
 
-官方可能未提供 arm64 版deb。可用 `--url`/`DEB_URL` 指向你实际找到的地址。
+这是已知限制：fnOS 上 `systemctl daemon-reload` 会超时，服务靠 `setsid` 启动而非 systemd unit。重启后重新执行上面的启动命令即可。
 
 ---
 
@@ -150,14 +172,21 @@ DEB_FILE=/tmp/workbuddy_1.0.0_amd64.deb \
 
 | | x86_64 | aarch64 |
 |---|---|---|
-| 对应 fpk | `fnwb.workbuddy_1.0.0_x86.fpk` | `fnwb.workbuddy_1.0.0_arm.fpk` |
-| NAS 型号 | 多数 Intel/AMD 飞牛 |  OEC 等 ARM 机型 |
+| 对应 fpk | `fnwb.workbuddy_1.2.2_x86.fpk` | `fnwb.workbuddy_1.2.2_arm.fpk` |
+| NAS 型号 | 多数 Intel/AMD飞牛 | 飞牛 OEC 等 ARM 机型 |
+| 解包后占用 | 约 950 MB | 约 2.7 GB |
+| 验证状态 | ✅ 生产环境验证 | ✅ 生产环境验证 |
 
 用 `uname -m` 查看自己的架构：`x86_64` 选 x86，`aarch64` 选 arm。
 
-**安装期磁盘需求约 2.6GB**（deb 约 429MB + 解包约 1.3GB）。装完自动删除 deb，稳定占用约 1.3GB，位于存储池而非系统分区。
+**安装期磁盘需求约 2.6GB**（deb 约 400MB + 解包）。装完自动删除 deb，稳定占用位于存储池而非系统分区。
 
-> **ARM 机型注意**：arm 版的 fpk 已正常打包，安装器会自动识别架构并下载 `arm64` 的 deb。但**官方是否提供 arm64 版 deb尚未验证**。若你的OEC 安装时提示下载失败，说明官方未提供该架构的包 —— 这时请用 `--url` / `DEB_URL` 指向你实际找到的下载地址。
+### 机型自适应
+
+安装器会根据宿主机自动适配，以下两个都是真机验证过的：
+
+- **`/tmp` 较小的 ARM 机型** —— 飞牛 OEC 的 `/tmp` 是 977MB 的 tmpfs，装不下 400MB 的 deb。安装器因此把下载暂存到**存储池**，空间检查也跟随实际安装卷而非硬编码路径。
+- **小内存机型** —— V8 堆上限按总内存自动分档（2GB 机器用 768MB，12GB 以下1024MB，更大用 1536MB）。在 2GB 的 OEC 上实测 RSS 约 270MB，不会触发 OOM。
 
 ---
 
@@ -198,8 +227,8 @@ FNPACK=/path/to/fnpack ./build.sh
 产物在 `dist/`：
 
 ```
-fnwb.workbuddy_1.0.0_x86.fpk
-fnwb.workbuddy_1.0.0_arm.fpk
+fnwb.workbuddy_1.2.2_x86.fpk
+fnwb.workbuddy_1.2.2_arm.fpk
 SHA256SUMS
 ```
 
