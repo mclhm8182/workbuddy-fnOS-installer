@@ -1,0 +1,123 @@
+#!/bin/bash
+# cmd/main — fnOS 生命周期入口
+# SPDX-License-Identifier: MIT
+#
+# 由 fnOS 应用中心调用，不是给用户手动执行的。
+#
+# 退出码约定（fnOS 依赖）：
+#   status -> exit 0 运行中/ exit 3 未运行
+#   其他错误 -> 写日志后 exit 1
+#
+# 注意：本脚本只管理"程序本体"（/vol1/1000/workbuddy）的启停。
+# 应用注册目录（/usr/local/apps/@appcenter/fnwb.workbuddy）由 fnOS 自己管理。
+
+CMD_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# shellcheck source=lib/common.sh
+. "$CMD_DIR/lib/common.sh"
+
+APP_DATA="${WORKBUDDY_APP_DIR:-/vol1/1000/app_workbuddy}"
+
+# fnOS 注入 TRIM_PKGVAR（通常是 /var/apps/<appid>）。
+# 该目录不一定存在（如手工执行脚本时），故回退到 $APP_DATA 下的日志。
+if [ -n "${TRIM_PKGVAR:-}" ] && [ -d "${TRIM_PKGVAR:-}" ]; then
+    LOG_FILE="${TRIM_PKGVAR}/info.log"
+    PID_FILE="${TRIM_PKGVAR}/app.pid"
+else
+    mkdir -p "$APP_DATA" 2>/dev/null || true
+    LOG_FILE="$APP_DATA/service.log"
+    PID_FILE="$APP_DATA/service.pid"
+fi
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+# 找到可用的启动脚本
+find_runner() {
+    for f in "$APP_DATA/login_runner.sh" "$APP_DATA/start.sh"; do
+        [ -f "$f" ] && { echo "$f"; return 0; }
+    done
+    return 1
+}
+
+start_process() {
+    if status; then
+        return 0
+    fi
+
+    runner=$(find_runner) || {
+        log_msg "start failed: no runner script in $APP_DATA"
+        return 1
+    }
+
+    log_msg "Starting WorkBuddy via $runner"
+    nohup /bin/sh "$runner" >>"$LOG_FILE" 2>&1 &
+    printf "%s" "$!" >"$PID_FILE"
+
+    # 等待端口就绪，最多 40 秒
+    for _ in $(seq 1 40); do
+        if ss -lnt 2>/dev/null | grep -q ":${APP_PORT}[[:space:]]"; then
+            log_msg "Service is listening on ${APP_PORT}"
+            return 0
+        fi
+        sleep 1
+    done
+
+    log_msg "Warning: port ${APP_PORT} not listening after 40s"
+    return 0   # 不判失败：程序可能仍在初始化，交给 status 复查
+}
+
+stop_process() {
+    log_msg "Stopping WorkBuddy"
+
+    # 优先按端口停止
+    pid=$(ss -lntp 2>/dev/null | grep ":${APP_PORT}[[:space:]]" \
+          | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+    [ -n "$pid" ] || pid=$(cat "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        log_msg "send TERM to ${pid}"
+        kill -TERM "$pid" 2>/dev/null || true
+
+        count=0
+        while kill -0 "$pid" 2>/dev/null && [ $count -lt 15 ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+
+        if kill -0 "$pid" 2>/dev/null; then
+            log_msg "send KILL to ${pid}"
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+
+    rm -f "$PID_FILE"
+    log_msg "Stopped"
+    return 0
+}
+
+status() {
+    if ss -lnt 2>/dev/null | grep -q ":${APP_PORT}[[:space:]]"; then
+        return 0      # 运行中
+    fi
+    return 3          # 未运行
+}
+
+case "${1:-}" in
+    start)
+        start_process
+        ;;
+    stop)
+        stop_process
+        ;;
+    status)
+        status
+        exit $?
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+
+exit 0
