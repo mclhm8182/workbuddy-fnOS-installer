@@ -31,7 +31,7 @@ HOSTARCH_darwin_x64="darwin-amd64"
 HOSTARCH_linux_x64="linux-amd64"
 
 APP_NAME="fnwb.workbuddy"
-APP_VERSION="1.2.2"
+APP_VERSION="1.2.4"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     C_GRN='\033[0;32m'; C_YEL='\033[0;33m'; C_BLU='\033[0;34m'; C_RST='\033[0m'
@@ -152,6 +152,14 @@ for PLAT in $PLATFORMS; do
     rm -f "$WORK/${APP_NAME}/manifest.bak"
     grep -q "^platform *= *${PLAT}$" "$WORK/${APP_NAME}/manifest" \
         || die "manifest 的 platform 字段改写失败"
+
+    # 把安装器版本注入 install_init（保持与 APP_VERSION 一致），
+    # 用于“仅升级安装器、本体版本未变”时判断是否需要刷新启动脚本。
+    sed -i.bak "s/^INSTALLER_VERSION=.*/INSTALLER_VERSION=\"${APP_VERSION}\"/" \
+        "$WORK/${APP_NAME}/cmd/install_init"
+    rm -f "$WORK/${APP_NAME}/cmd/install_init.bak"
+    grep -q "^INSTALLER_VERSION=\"${APP_VERSION}\"$" "$WORK/${APP_NAME}/cmd/install_init" \
+        || warn "install_init 的 INSTALLER_VERSION 注入失败（将沿用字面量默认值）"
     ok "manifest platform=${PLAT}"
 
     # fnpack build -d <应用源码目录>

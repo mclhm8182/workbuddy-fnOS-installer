@@ -128,6 +128,14 @@ installed_version() {
 
 CUR_INSTALLED=$(installed_version || true)
 
+# 安装器（fpk）自身版本：由 build.sh 用 APP_VERSION 注入此字面量。
+# 用于判断“仅升级了安装器、WorkBuddy 本体版本未变”时是否仍需刷新启动脚本。
+INSTALLER_VERSION="1.2.4"
+CUR_INSTALLER=$(cat "$APP_DATA/.installer_version" 2>/dev/null | tr -d '[:space:]')
+
+# 标记：跳过本体下载时，是否仍需刷新启动脚本（安装器版本变化时才置 1）
+NEED_REFRESH_STARTSH=0
+
 # 需要先取到官方版本才能判断，故在未指定 DEB_FILE 时提前查询
 if [ -z "$DEB_FILE" ] && [ -z "$DEB_URL" ]; then
     step "查询官方最新版本"
@@ -142,8 +150,14 @@ if [ -z "$DEB_FILE" ] && [ -z "$DEB_URL" ]; then
 fi
 
 if [ -n "$VERSION" ] && [ -n "$CUR_INSTALLED" ] && [ "$CUR_INSTALLED" = "$VERSION" ] && [ -z "$DEB_FILE" ] && [ -z "$DEB_URL" ]; then
-    ok "已是最新版本 $VERSION，跳过安装"
+    ok "已是最新版本 $VERSION，跳过下载与解包"
     INSTALL_SKIP=1
+    # 安装器（fpk）版本若已变化，标记需要刷新启动脚本。
+    # 真正的刷新放在脚本后方（函数已定义处）执行，见 NEED_REFRESH_STARTSH。
+    if [ "${CUR_INSTALLER:-}" != "${INSTALLER_VERSION}" ] || [ ! -f "$APP_DATA/start.sh" ]; then
+        NEED_REFRESH_STARTSH=1
+        info "安装器已更新（${CUR_INSTALLER:-无} -> ${INSTALLER_VERSION}），将刷新启动脚本"
+    fi
 else
     INSTALL_SKIP=0
     [ -n "$CUR_INSTALLED" ] && info "升级：$CUR_INSTALLED -> ${VERSION:-最新}"
@@ -360,6 +374,21 @@ export HOME="\$BASE/home"
 export TMPDIR="\$BASE/tmp"
 mkdir -p "\$HOME" "\$TMPDIR"
 
+# ---------------------------------------------------------------------
+# 身份认证 / 登录（重要）
+#
+#   WorkBuddy 网关的网页登录使用腾讯 SSO（copilot.tencent.com）扫码。
+#   流程由网关主动向外轮询腾讯 SSO 完成账号绑定，因此：
+#     - 不需要把网关暴露到公网，也不需要任何反向代理 / 隧道；
+#     - 不依赖 CODEBUDDY_BASE_URL（该变量是模型与 Remote Control 的 API
+#       地址，设置为局域网地址反而会破坏模型调用，切勿设置）。
+#
+#   只要 NAS 能访问外网（copilot.tencent.com、tencent.sso.copilot.tencent.com），
+#   普通用户在 fnOS 门户打开 WorkBuddy 后扫码即可登录并绑定账号，
+#   对话历史将随账号持久化（解决“换窗口历史丢失”问题）。
+#
+#   访问鉴权见下方 AUTH_MODE；写入 $BASE/AUTH_MODE=password 可启用密码。
+# ---------------------------------------------------------------------
 # 使用官方自带的 Node 运行时
 [ -d "$_nodedir" ] && export PATH="$_nodedir:\$PATH"
 
@@ -399,18 +428,29 @@ fi
 # 取得总内存后按比例推算，可用 MEM_TOTAL_MB 覆盖。
 # ---------------------------------------------------------------------
 _mem_total_mb() {
-    if [ -n "${MEM_TOTAL_MB:-}" ]; then
-        echo "$MEM_TOTAL_MB"; return
+    if [ -n "\${MEM_TOTAL_MB:-}" ]; then
+        echo "\${MEM_TOTAL_MB}"; return
     fi
-    _t=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
-    [ -n "$_t" ] || _t=2048
-    echo "$_t"
+    _t=""
+    # 来源1：/proc/meminfo（多数 Linux 可读；字段 \$2 为 MemTotal 的 KB 数）
+    _t=\$(awk '/^MemTotal:/{printf "%d", \$2/1024}' /proc/meminfo 2>/dev/null)
+    # 来源2：free -m（部分精简系统无 /proc/meminfo 时兜底）
+    if [ -z "\$_t" ] && command -v free >/dev/null 2>&1; then
+        _t=\$(free -m 2>/dev/null | awk '/^Mem:/{print \$2}')
+    fi
+    # 来源3：vmstat -s
+    if [ -z "\$_t" ] && command -v vmstat >/dev/null 2>&1; then
+        _t=\$(vmstat -s 2>/dev/null | awk '/total memory/{printf "%d", \$1/1024}')
+    fi
+    # 兜底 + 强制为正整数，避免 [ ] 整数比较报 "integer expression expected"
+    case "\$_t" in ''|*[!0-9]*) _t=1536 ;; esac
+    echo "\$_t"
 }
 
-_total=$(_mem_total_mb)
-if [ "$_total" -lt 3072 ]; then
+_total=\$(_mem_total_mb)
+if [ "\$_total" -lt 3072 ]; then
     HEAP_MB=768
-elif [ "$_total" -lt 12288 ]; then
+elif [ "\$_total" -lt 12288 ]; then
     HEAP_MB=1024
 else
     HEAP_MB=1536
@@ -424,8 +464,10 @@ exec "\$APPDIR/resources/app.asar.unpacked/cli/bin/codebuddy" \\
 EOS
     chmod +x "$_dir/start.sh" || return 1
 
-    # 默认不启用密码（开箱即用）
-    printf 'none\n' >"$_dir/AUTH_MODE"
+    # 默认不启用密码（开箱即用）；仅在尚未设置时写入，避免覆盖用户已切换的密码模式
+    if [ ! -s "$_dir/AUTH_MODE" ]; then
+        printf 'none\n' >"$_dir/AUTH_MODE"
+    fi
 
     # --- 生成开机自启用的包装脚本 ---
     cat >"$_dir/login_runner.sh" <<EOS
@@ -553,15 +595,13 @@ EOC
     # （安装到 /opt/WorkBuddy/，由 postinst 注册 /usr/bin/workbuddy）。
     # 但我们要的是在 fnOS 上跑一个常驻 Web 服务供 iframe 访问，
     # 所以这里自行生成启动脚本，直接拉起 Electron 主进程并监听 8090。
-    step "准备启动脚本"
-    if [ -f "$APP_DATA/start.sh" ]; then
-        chmod +x "$APP_DATA/start.sh" 2>/dev/null || true
-        ok "使用 deb 自带的启动脚本"
-    else
-        _write_fallback_scripts "$APP_DATA" \
-            || die "无法生成启动脚本：未能定位 WorkBuddy 程序入口
+    step "准备启动脚本（强制刷新为当前安装器版本）"
+    # 始终按当前安装器的模板重新生成 start.sh，避免旧版本缺陷脚本残留。
+    # AUTH_MODE / ACCESS_PASS 由 _write_fallback_scripts 在“未设置时才写入”，
+    # 因此不会覆盖用户已启用的密码模式。
+    _write_fallback_scripts "$APP_DATA" \
+        || die "无法生成启动脚本：未能定位 WorkBuddy 程序入口
 请查看 $LOG_FILE 中的日志。"
-    fi
 
     # ------------------------------------------------------------ 校验
     step "校验安装结果"
@@ -582,6 +622,25 @@ EOC
     cleanup
     TMP_DEB=""
 fi
+
+# ---------------------------------------------------------------- 刷新启动脚本（跳过本体下载时）
+#
+# 若本次仅升级了安装器（fpk）而 WorkBuddy 本体版本未变，上面的安装块会被跳过，
+# 但安装器的登录/认证修复必须落到已安装的 NAS 上，因此此处按安装器版本刷新 start.sh。
+# _write_fallback_scripts 在“AUTH_MODE 未设置时才写入”，不会覆盖用户的密码模式。
+if [ "${NEED_REFRESH_STARTSH:-0}" = "1" ]; then
+    step "刷新启动脚本（安装器已更新至 ${INSTALLER_VERSION}）"
+    if _write_fallback_scripts "$APP_DATA"; then
+        ok "启动脚本已刷新为安装器 ${INSTALLER_VERSION} 版本"
+    else
+        warn "启动脚本刷新失败，将沿用现有脚本；若扫码登录异常请手动重启应用"
+    fi
+fi
+
+# ---------------------------------------------------------------- 记录安装器版本
+#
+# 供下次升级判断“安装器是否变化”，见上方 INSTALL_SKIP 分支与刷新逻辑。
+printf '%s\n' "${INSTALLER_VERSION:-unknown}" >"$APP_DATA/.installer_version" 2>/dev/null || true
 
 # ---------------------------------------------------------------- 桌面入口
 #

@@ -1,5 +1,5 @@
 appname = fnwb.workbuddy
-version = 1.2.2
+version = 1.2.4
 display_name = WorkBuddy
 desc = WorkBuddy 的第三方安装器。安装时从官方地址获取官方 .deb 并解包为 fnOS 应用，不包含 WorkBuddy 任何二进制。本工具与 WorkBuddy 官方无隶属关系。
 platform = x86
@@ -15,4 +15,4 @@ desktop_uidir = ui
 desktop_applaunchname = fnwb.workbuddy.main
 install_type = root
 ctl_stop = true
-changelog = V8 堆上限按机器内存自适应（2GB 机型用 768MB，避免 OOM）；deb 落存储池而非 /tmp；空间检查跟随实际安装卷
+changelog = 修复 start.sh 内存检测：打包期变量被错误展开，导致生成脚本里总内存为空、V8 堆上限恒为 1536MB 且启动报 integer expression expected；改为多来源探测（/proc/meminfo→free -m→vmstat -s）并强制正整数兜底，OEC 2GB 机型现在真正按 768MB 限制堆；deb 落存储池而非 /tmp；空间检查跟随实际安装卷
