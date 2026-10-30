@@ -33,6 +33,23 @@ log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >>"$LOG_FILE" 2>/dev/null || true
 }
 
+# 端口是否在监听：依次尝试 ss / netstat / /proc/net/tcp，
+# 避免某些精简系统缺失 ss 时 status() 永远返回“未运行”，导致应用中心一直转圈。
+port_listening() {
+    p="${APP_PORT:-8090}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -lnt 2>/dev/null | grep -q ":${p}[[:space:]]" && return 0
+    fi
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -lnt 2>/dev/null | grep -q ":${p}[[:space:]]" && return 0
+    fi
+    hex=$(printf '%04X' "$p" 2>/dev/null)
+    if [ -n "$hex" ] && awk -v h=":$hex" '$4=="0A" && $2 ~ h {f=1} END{exit !f}' /proc/net/tcp 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 # 找到可用的启动脚本
 find_runner() {
     for f in "$APP_DATA/login_runner.sh" "$APP_DATA/start.sh"; do
@@ -52,20 +69,27 @@ start_process() {
     }
 
     log_msg "Starting WorkBuddy via $runner"
-    nohup /bin/sh "$runner" >>"$LOG_FILE" 2>&1 &
+    # 关键修复：用 setsid 彻底脱离 fnOS 启动会话。
+    # 仅用 nohup 时，服务进程会随 fnOS 的启动会话结束被 SIGHUP 杀掉，
+    # 表现为“刚启动就没了 / 应用中心一直转圈”。setsid 缺失时退化为 nohup。
+    if command -v setsid >/dev/null 2>&1; then
+        setsid nohup /bin/sh "$runner" >>"$LOG_FILE" 2>&1 </dev/null &
+    else
+        nohup /bin/sh "$runner" >>"$LOG_FILE" 2>&1 &
+    fi
     printf "%s" "$!" >"$PID_FILE"
 
-    # 等待端口就绪，最多 40 秒
-    for _ in $(seq 1 40); do
-        if ss -lnt 2>/dev/null | grep -q ":${APP_PORT}[[:space:]]"; then
+    # 等待端口就绪，最多 60 秒；端口真正监听才算启动成功
+    for _ in $(seq 1 60); do
+        if port_listening; then
             log_msg "Service is listening on ${APP_PORT}"
             return 0
         fi
         sleep 1
     done
 
-    log_msg "Warning: port ${APP_PORT} not listening after 40s"
-    return 0   # 不判失败：程序可能仍在初始化，交给 status 复查
+    log_msg "Warning: port ${APP_PORT} not listening after 60s"
+    return 1
 }
 
 stop_process() {
@@ -98,7 +122,7 @@ stop_process() {
 }
 
 status() {
-    if ss -lnt 2>/dev/null | grep -q ":${APP_PORT}[[:space:]]"; then
+    if port_listening; then
         return 0      # 运行中
     fi
     return 3          # 未运行
