@@ -119,9 +119,13 @@ require_space_mb() {
 # ---------------------------------------------------------------- 进程管理
 
 port_owner() {
-    have_cmd ss >/dev/null 2>&1 || return 1
-    ss -lntp 2>/dev/null | grep ":${APP_PORT}[[:space:]]" \
-        | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    if have_cmd ss; then
+        ss -lntp 2>/dev/null | grep ":${APP_PORT}[[:space:]]" \
+            | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    elif have_cmd netstat; then
+        netstat -lntp 2>/dev/null | grep ":${APP_PORT}[[:space:]]" \
+            | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    fi
 }
 
 is_running() {
