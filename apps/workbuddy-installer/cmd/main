@@ -52,20 +52,28 @@ start_process() {
     }
 
     log_msg "Starting WorkBuddy via $runner"
-    nohup /bin/sh "$runner" >>"$LOG_FILE" 2>&1 &
+    # setsid 彻底脱离 fnOS 的启动会话。
+    # 只用 nohup 时，fnOS 结束启动会话的瞬间子进程会收到 SIGHUP 被误杀，
+    # 表现为"刚启动就没了"、8090 永不监听、应用中心一直转圈（见 PR #3）。
+    if have_cmd setsid >/dev/null 2>&1; then
+        setsid nohup /bin/sh "$runner" >>"$LOG_FILE" 2>&1 </dev/null &
+    else
+        nohup /bin/sh "$runner" >>"$LOG_FILE" 2>&1 </dev/null &
+    fi
     printf "%s" "$!" >"$PID_FILE"
 
-    # 等待端口就绪，最多 40 秒
-    for _ in $(seq 1 40); do
-        if ss -lnt 2>/dev/null | grep -q ":${APP_PORT}[[:space:]]"; then
+    # 等待端口就绪，最多 60 秒（以端口真正 LISTEN 为准）
+    for _ in $(seq 1 60); do
+        if port_listening "$APP_PORT"; then
             log_msg "Service is listening on ${APP_PORT}"
             return 0
         fi
         sleep 1
     done
 
-    log_msg "Warning: port ${APP_PORT} not listening after 40s"
-    return 0   # 不判失败：程序可能仍在初始化，交给 status 复查
+    log_msg "Warning: port ${APP_PORT} not listening after 60s"
+    # 明确返回失败：否则应用中心会误判为"已运行"而一直转圈
+    return 1
 }
 
 stop_process() {
@@ -98,7 +106,7 @@ stop_process() {
 }
 
 status() {
-    if ss -lnt 2>/dev/null | grep -q ":${APP_PORT}[[:space:]]"; then
+    if port_listening "$APP_PORT"; then
         return 0      # 运行中
     fi
     return 3          # 未运行

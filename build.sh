@@ -31,7 +31,7 @@ HOSTARCH_darwin_x64="darwin-amd64"
 HOSTARCH_linux_x64="linux-amd64"
 
 APP_NAME="fnwb.workbuddy"
-APP_VERSION="1.2.4"
+APP_VERSION="1.2.5"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     C_GRN='\033[0;32m'; C_YEL='\033[0;33m'; C_BLU='\033[0;34m'; C_RST='\033[0m'
@@ -107,7 +107,7 @@ fnpack 官方未提供该平台版本。请在 x86_64 Linux、arm64 Linux 或 ma
     mkdir -p "$(dirname "$FNPACK_LOCAL")"
 
     if have_cmd curl; then
-        curl -fL --connect-timeout 20 --retry2 -o "$FNPACK_LOCAL" "$url" \
+        curl -fL --connect-timeout 20 --retry 2 -o "$FNPACK_LOCAL" "$url" \
             || die "下载失败：$url"
     elif have_cmd wget; then
         wget --timeout=20 --tries=2 -O "$FNPACK_LOCAL" "$url" \

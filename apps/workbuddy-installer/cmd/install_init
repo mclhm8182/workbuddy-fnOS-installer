@@ -459,6 +459,33 @@ fi
 export NODE_OPTIONS="--max-old-space-size=\$HEAP_MB"
 echo "WorkBuddy: 机器内存 \${_total}MB，V8 堆上限 \${HEAP_MB}MB"
 
+# ---------------------------------------------------------------------
+# 运行时 bundle 选择（兼容 WB 5.6.x 的新包结构）
+#
+#   WB 5.6.2 起，官方 deb 不再随包提供"完整桌面 bundle"
+#   （resources/app.asar.unpacked/cli/dist/codebuddy.js），
+#   而 CLI 入口默认仍执行 require('../dist/codebuddy')，
+#   直接抛 MODULE_NOT_FOUND 崩溃 —— 表现为应用"装完就打不开"、
+#   在应用中心反复启用/退出（GitHub issue #2 / #4）。
+#
+#   官方为此提供了 CODEBUDDY_FORCE_HEADLESS_BUNDLE 开关，指向随包提供的
+#   cli/dist/codebuddy-headless.js。NAS 网关正是 headless 场景，
+#   且该 bundle 体积更小（12MB vs 20MB），更适合小内存机型。
+#
+#   仅在"完整 bundle 不存在"时才启用；旧版本（如 5.5.6）行为保持不变。
+#   若将来 headless bundle 也改名/移除，则退到 lite-wb bundle。
+# ---------------------------------------------------------------------
+_CLI_DIST="\$APPDIR/resources/app.asar.unpacked/cli/dist"
+if [ ! -f "\$_CLI_DIST/codebuddy.js" ]; then
+    if [ -f "\$_CLI_DIST/codebuddy-headless.js" ]; then
+        export CODEBUDDY_FORCE_HEADLESS_BUNDLE=1
+        echo "WorkBuddy: 检测到新版包结构（无完整 bundle），启用 headless bundle"
+    elif [ -f "\$_CLI_DIST/codebuddy-lite-wb.mjs" ]; then
+        export CODEBUDDY_FORCE_LITE_WB_BUNDLE=1
+        echo "WorkBuddy: 检测到新版包结构，启用 lite-wb bundle"
+    fi
+fi
+
 exec "\$APPDIR/resources/app.asar.unpacked/cli/bin/codebuddy" \\
     --serve --host 0.0.0.0 --port ${APP_PORT}
 EOS

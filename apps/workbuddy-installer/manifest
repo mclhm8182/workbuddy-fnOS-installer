@@ -1,5 +1,5 @@
 appname = fnwb.workbuddy
-version = 1.2.4
+version = 1.2.5
 display_name = WorkBuddy
 desc = WorkBuddy 的第三方安装器。安装时从官方地址获取官方 .deb 并解包为 fnOS 应用，不包含 WorkBuddy 任何二进制。本工具与 WorkBuddy 官方无隶属关系。
 platform = x86
@@ -15,4 +15,4 @@ desktop_uidir = ui
 desktop_applaunchname = fnwb.workbuddy.main
 install_type = root
 ctl_stop = true
-changelog = 修复 start.sh 内存检测：打包期变量被错误展开，导致生成脚本里总内存为空、V8 堆上限恒为 1536MB 且启动报 integer expression expected；改为多来源探测（/proc/meminfo→free -m→vmstat -s）并强制正整数兜底，OEC 2GB 机型现在真正按 768MB 限制堆；deb 落存储池而非 /tmp；空间检查跟随实际安装卷
+changelog = 修复 WB 5.6.2 新版结构导致的"安装后打不开"（issue #2 / #4）：官方新 deb 不再随包提供完整桌面 bundle（cli/dist/codebuddy.js），CLI 默认 require('../dist/codebuddy') 直接 MODULE_NOT_FOUND 崩溃；现由生成的 start.sh 自动检测并在缺失时启用官方 CODEBUDDY_FORCE_HEADLESS_BUNDLE 开关（指向随包的 cli/dist/codebuddy-headless.js，NAS 网关本就是 headless 场景，体积也更小），旧版本行为不变。另修复启动会话结束被 SIGHUP 误杀导致应用中心一直转圈（改用 setsid 脱离会话）、端口检测增加 netstat//proc/net/tcp 回退（精简系统无 ss 时不再永远判定未运行）、build.sh 中 curl --retry2 参数笔误。

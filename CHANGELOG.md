@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.2.5 — 2026-11-03
+
+修复 WorkBuddy 升级到 5.6.2 后「安装完打不开」，并修掉两个长期存在的启动/构建缺陷。
+
+### 根因：官方新包结构移除了完整 bundle
+- WB **5.6.2** 起，官方 deb 不再随包提供完整桌面 bundle
+  `resources/app.asar.unpacked/cli/dist/codebuddy.js`（5.5.6 时有，23MB）。
+- 但 CLI 入口 `cli/bin/codebuddy` 默认仍执行 `require('../dist/codebuddy')`，
+  于是启动即抛 `MODULE_NOT_FOUND` 崩溃：
+
+  ```
+  Error: Cannot find module '../dist/codebuddy'
+  Require stack:
+  - .../resources/app.asar.unpacked/cli/bin/codebuddy
+      at .../cli/bin/codebuddy:205:13
+  ```
+
+- 表现就是 issue #2「打开闪退、自动变成未启用、反复重复」与 issue #4「启用打开就退出」。
+- 5.6.2 的新结构改为随包提供 `cli/dist/codebuddy-headless.js`（12MB）与
+  `cli/dist/codebuddy-lite-wb.mjs`（11MB）+ 各自的 `lazy-*` 分块目录。
+
+### 修复 1：运行时按需选择 bundle
+- 生成的 `start.sh` 增加检测：若 `cli/dist/codebuddy.js`（完整 bundle）不存在、
+  而 `codebuddy-headless.js` 存在，则 `export CODEBUDDY_FORCE_HEADLESS_BUNDLE=1`
+  （官方提供的开关，注释即「在 spawn cbc 前设置」）。
+- 若将来 headless bundle 也移除，则退到 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`。
+- **旧版本（5.5.6 等）不存在该分支，行为完全不变**；NAS 网关本就是 headless 场景，
+  且 headless bundle 体积更小（12MB vs 20MB），更适合小内存机型。
+- 已实测（x86 NAS 上解包 5.6.2 官方 deb）：
+  - 不加开关 → 复现一模一样的 `Cannot find module '../dist/codebuddy'`；
+  - 加开关 → 服务正常启动，Web UI 返回 HTTP 200，`CODEBUDDY_GATEWAY_AUTH=none` 依旧生效
+    （日志显示 "Authentication is DISABLED"）。
+
+### 修复 2：启动被 SIGHUP 误杀（应用中心一直转圈）
+- `cmd/main` 的 `start_process` 原先只用 `nohup ... &`。fnOS 结束启动会话的瞬间，
+  子进程会收到 SIGHUP 被杀掉 → 8090 永不监听 → 应用中心一直转圈。
+- 改为 `setsid nohup ... </dev/null &`（无 setsid 时退回 nohup），彻底脱离启动会话。
+
+### 修复 3：端口检测回退
+- 新增 `port_listening()`：`ss` → `netstat` → `/proc/net/tcp`（十六进制端口 + 状态 0A）三级回退，
+  精简系统没有 `ss` 时不再永远判定"未运行"。
+- `status()` 改用该函数；`start_process` 等待上限 40s → 60s，且端口未监听时**明确返回失败**
+  （原先返回 0 会让应用中心误判为已运行而一直转圈）。
+
+### 修复 4：build.sh 的 curl 参数笔误
+- 下载 fnpack 时写成 `--retry2`（curl 无此选项，会直接报错导致构建失败），改为 `--retry 2`。
+
 ## 1.2.4 — 2026-10-10
 
 移除 1.2.3 误注入的 `CODEBUDDY_BASE_URL` 逻辑，纠正对登录机制的误解，并澄清「跨窗口历史丢失」的真实根因与解法。

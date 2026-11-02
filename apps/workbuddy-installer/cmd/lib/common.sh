@@ -119,9 +119,38 @@ require_space_mb() {
 # ---------------------------------------------------------------- 进程管理
 
 port_owner() {
-    have_cmd ss >/dev/null 2>&1 || return 1
-    ss -lntp 2>/dev/null | grep ":${APP_PORT}[[:space:]]" \
-        | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    if have_cmd ss >/dev/null 2>&1; then
+        ss -lntp 2>/dev/null | grep ":${APP_PORT}[[:space:]]" \
+            | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    elif have_cmd netstat >/dev/null 2>&1; then
+        netstat -lntp 2>/dev/null | grep ":${APP_PORT}[[:space:]]" \
+            | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    else
+        return 1
+    fi
+}
+
+# 端口是否处于 LISTEN 状态
+#
+# 三级回退：ss → netstat → /proc/net/tcp。
+# 精简系统可能两个命令都没有，最后直接读内核的 /proc/net/tcp
+# （local_address 里端口是十六进制，状态 0A 即 LISTEN）。
+port_listening() {
+    _port="$1"
+    if have_cmd ss >/dev/null 2>&1; then
+        ss -lnt 2>/dev/null | grep -q ":${_port}[[:space:]]"
+        return $?
+    fi
+    if have_cmd netstat >/dev/null 2>&1; then
+        netstat -lnt 2>/dev/null | grep -q ":${_port}[[:space:]]"
+        return $?
+    fi
+    _hex=$(printf '%04X' "$_port" 2>/dev/null)
+    [ -n "$_hex" ] || return 1
+    awk -v want=":${_hex}" '
+        FNR>1 { split($2, a, ":"); if (a[2] == want && $4 == "0A") found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
 is_running() {
