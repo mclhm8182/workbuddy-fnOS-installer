@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.2.6 — 2026-11-03
+
+修复 WorkBuddy 5.6.x 装好后**网页端只有一段 API 文档占位页**、点不动的问题（issue #6）。
+
+### 根因：官方新包不再随包提供网页界面
+- WB **5.6.x** 起，官方 deb 不再包含网关的网页界面静态资源
+  `resources/app.asar.unpacked/cli/dist/web-ui/`（5.5.6 时存在，13MB / 895 个文件）。
+- 网关启动时按 `dist/web-ui/index.html` 查找该目录，找不到就退化成占位页：
+
+  ```
+  CodeBuddy Gateway
+  Web UI is not built. Use the API endpoints directly, or build the Web UI:
+  ```
+
+- 表现：8090 端口能连上、HTTP 200，但网页里只有一串 API 端点说明，
+  **没有任何可操作的界面** —— 与 issue #2 的「打不开」是同一批升级用户遇到的
+  第二道门槛（前者是进程崩溃，这个是进程活着但没界面）。
+- 已在官方 5.6.2 的 x64 / arm64 deb 上确认：`app.asar` 内 20388 个条目、
+  整个 WorkBuddy 目录树下**均无任何 web-ui 资产**；官方 CDN 也没有单独发布
+  web-ui 构件（其它平台包 URL 全部 404），官方更新接口只提供最新版、无法回溯指定版本。
+
+### 修复：从官方 5.5.6 包中抽取 web-ui 静态资源补齐
+- 5.5.6 是最后一个仍带 web-ui 的官方版本（5.6.0 起移除）。安装器在检测到
+  当前安装树缺少 `dist/web-ui/index.html` 时，自动从官方 5.5.6 的 deb 中
+  **只抽取 web-ui 目录**补进去。
+- **只下包头，不下整包**：web-ui 在 deb 的 data.tar 中排第 88 位（很靠前），
+  实测约 84MB 压缩数据即可抽全，故用 HTTP Range 只取前 96MB
+  （CDN 已确认 `accept-ranges: bytes`），比下满 429MB 少传约 78%，
+  实测 10 秒完成。
+- **完整性校验**：以「文件数 ≥ 100 且存在 index.html」为准，
+  并在抽完后逐文件与参照物比对（895 个文件 sha256 全部一致）。
+- **兼容性已实测**：5.5.6 的 web-ui 与 5.6.2 后端完全兼容 ——
+  把 SPA 实际调用的 67 个 `/api` 端点逐一对比
+  「5.5.6 自带后端」与「5.6.2 后端」，响应状态与内容 **SAME=67 / DIFF=0**；
+  另在 5.5.6 原装包与 5.6.2+移植包之间做同组对比，结果一致。
+- **架构无关**：web-ui 是纯前端静态资源，官方 x64 与 arm64 两个包内的该目录
+  逐字节相同（哈希一致），故两架构共用同一个 donor 源。
+- 生成的 `start.sh` 额外显式 `export CODEBUDDY_WEB_UI_ROOT=<dist>/web-ui`
+  （官方支持该环境变量），与包内目录查找双保险。
+- **自愈**：仅升级安装器、WorkBuddy 本体版本未变（跳过解包）时也会补齐；
+  官方未来若恢复该目录，检测到自带即跳过补齐逻辑，零副作用。
+
+### 其它
+- 沿用 1.2.5 的 bundle 兼容修复（`CODEBUDDY_FORCE_HEADLESS_BUNDLE`）、
+  `setsid` 启动修正与 `build.sh` 的 `curl --retry 2` 笔误修正。
+
 ## 1.2.5 — 2026-11-03
 
 修复 WorkBuddy 升级到 5.6.2 后「安装完打不开」，并修掉两个长期存在的启动/构建缺陷。

@@ -31,7 +31,7 @@ HOSTARCH_darwin_x64="darwin-amd64"
 HOSTARCH_linux_x64="linux-amd64"
 
 APP_NAME="fnwb.workbuddy"
-APP_VERSION="1.2.5"
+APP_VERSION="1.2.6"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     C_GRN='\033[0;32m'; C_YEL='\033[0;33m'; C_BLU='\033[0;34m'; C_RST='\033[0m'

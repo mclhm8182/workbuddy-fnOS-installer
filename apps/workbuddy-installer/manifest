@@ -1,5 +1,5 @@
 appname = fnwb.workbuddy
-version = 1.2.5
+version = 1.2.6
 display_name = WorkBuddy
 desc = WorkBuddy 的第三方安装器。安装时从官方地址获取官方 .deb 并解包为 fnOS 应用，不包含 WorkBuddy 任何二进制。本工具与 WorkBuddy 官方无隶属关系。
 platform = x86
@@ -15,4 +15,4 @@ desktop_uidir = ui
 desktop_applaunchname = fnwb.workbuddy.main
 install_type = root
 ctl_stop = true
-changelog = 修复 WB 5.6.2 新版结构导致的"安装后打不开"（issue #2 / #4）：官方新 deb 不再随包提供完整桌面 bundle（cli/dist/codebuddy.js），CLI 默认 require('../dist/codebuddy') 直接 MODULE_NOT_FOUND 崩溃；现由生成的 start.sh 自动检测并在缺失时启用官方 CODEBUDDY_FORCE_HEADLESS_BUNDLE 开关（指向随包的 cli/dist/codebuddy-headless.js，NAS 网关本就是 headless 场景，体积也更小），旧版本行为不变。另修复启动会话结束被 SIGHUP 误杀导致应用中心一直转圈（改用 setsid 脱离会话）、端口检测增加 netstat//proc/net/tcp 回退（精简系统无 ss 时不再永远判定未运行）、build.sh 中 curl --retry2 参数笔误。
+changelog = 修复 WB 5.6.x 装好后网页端只有一段 API 文档占位页、点不动（issue #6）：官方新 deb 起不再随包提供网关的网页界面静态资源 cli/dist/web-ui/，网关找不到该目录即退化为占位页（"Web UI is not built"），表现为 8090 能连上但网页里没有任何可操作界面；现由安装器自动检测并在缺失时从官方 5.5.6 包中只抽取 web-ui 目录补齐（web-ui 在 data.tar 中排第 88 位，用 HTTP Range 只取包头约 96MB 即可抽全，比下满 429MB 少传约 78%，实测 10 秒完成），并以文件数与 index.html 校验完整性；已实测 5.5.6 的 web-ui 与 5.6.2 后端完全兼容（SPA 调用的 67 个 /api 端点响应逐条一致），且 x64/arm64 两包内该目录逐字节相同故两架构共用同一源。同时沿用 1.2.5 的 bundle 兼容修复（CODEBUDDY_FORCE_HEADLESS_BUNDLE）、setsid 启动修正与 build.sh 的 curl --retry 2 笔误修正。

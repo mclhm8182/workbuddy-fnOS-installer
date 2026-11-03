@@ -13,6 +13,7 @@ CMD_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # shellcheck source=lib/common.sh
 . "$CMD_DIR/lib/common.sh"
+. "$CMD_DIR/lib/install_funcs.sh"
 
 # 安装期落盘到存储池（应用注册目录在系统分区，不放大文件）
 #
@@ -49,18 +50,59 @@ log "安装目标: $APP_DATA"
 # ---------------------------------------------------------------- 冲突检测
 #
 # 冲突处理原则：
-#   1. 目标目录已有文件 → 中止（这是真风险，可能覆盖未知的同路径安装）
-#   2. 检测到其它目录已有 WorkBuddy → **仅提示，不阻断**
+#   1. 目标目录已有**本安装器的旧安装** → 允许覆盖升级（这是正常路径，
+#      用户从旧版升级时 APP_DATA 必然非空，绝不能因此失败）；
+#   2. 目标目录里有**不认识的其它内容** → 中止（真风险，可能覆盖用户的
+#      其它数据）；
+#   3. 检测到其它目录已有 WorkBuddy → **仅提示，不阻断**
 #      fnOS 通过应用中心执行本脚本，属非交互环境，无法回答 y/n；
 #      若在此询问会导致普通用户永远装不上。故只告知影响后继续。
-#   3. 端口被其它实例占用 → 中止（避免误停用户正在用的服务）
+#   4. 端口被其它实例占用 → 中止（避免误停用户正在用的服务）
+#
+# 历史教训：此前对"目录非空"一律 die，导致**任何升级都必然失败**
+# （appcenter 报 code 10237 并回滚，用户看到的现象是"装了两次都装不上"）。
 
 LEGACY_DIR="/vol1/1000/workbuddy"
 
+# 判定 $1 目录是否为本安装器留下的安装（而非用户的其它数据）
+_is_our_install() {
+    _d="$1"
+    [ -d "$_d" ] || return 1
+    # 本安装器写下的标记
+    [ -f "$_d/.installed_version" ] && return 0
+    [ -f "$_d/.installer_version" ] && return 0
+    [ -f "$_d/start.sh" ] && return 0
+    # 本安装器管理的程序本体
+    [ -d "$_d/opt/WorkBuddy" ] && return 0
+    [ -d "$_d/opt/apps" ] && return 0
+    # 只剩下本安装器会产生的那些条目（中断的安装残留）
+    if [ -n "$(ls -A "$_d" 2>/dev/null)" ]; then
+        _unknown=""
+        for _e in $(ls -A "$_d" 2>/dev/null); do
+            case "$_e" in
+                home|tmp|opt|usr|etc|lib|bin|sbin|share|var|resources|\
+                AUTH_MODE|ACCESS_PASS|start.sh|login_runner.sh|run.sh|\
+                .installed_version|.installer_version|.gateway_pass) ;;
+                *) _unknown="$_unknown $_e" ;;
+            esac
+        done
+        [ -z "$_unknown" ] && return 0
+        log "目录中存在非本安装器的内容：$_unknown"
+    fi
+    return 1
+}
+
 if [ -n "$(ls -A "$APP_DATA" 2>/dev/null)" ]; then
-    die "目标目录已存在且非空：$APP_DATA
+    if _is_our_install "$APP_DATA"; then
+        # 只是标记，**暂不清理**：还不知道本次是要重装还是"已是最新版本"，
+        # 若是后者就绝不能动现有程序本体。真正的清理见下方 ALLOW_OVERWRITE 分支。
+        ALLOW_OVERWRITE=1
+        info "检测到本安装器的旧安装，允许覆盖升级"
+    else
+        die "目标目录已存在且非空：$APP_DATA
 为避免覆盖已有安装，已中止。
 若确认要覆盖，请先手动清空该目录，或设置 WORKBUDDY_APP_DIR 指向新路径。"
+    fi
 fi
 
 if [ -n "$(ls -A "$LEGACY_DIR" 2>/dev/null)" ]; then
@@ -276,6 +318,22 @@ else
         stop_service || warn "停止服务返回异常，继续"
     fi
 
+    # ------------------------------------------------------------ 清理旧程序本体
+    #
+    # 仅在**真的要重装**时执行（INSTALL_SKIP=0 时才走到这里）。
+    # 只删程序本体，保留运行期数据：
+    #   home/（含 .codebuddy 登录态与对话历史）、AUTH_MODE、ACCESS_PASS
+    # —— 这样用户升级后不需要重新扫码登录。
+    if [ "${ALLOW_OVERWRITE:-0}" = "1" ]; then
+        step "清理旧版本程序本体（保留登录态与密码设置）"
+        rm -rf "$APP_DATA/opt" "$APP_DATA/usr" "$APP_DATA/etc" \
+               "$APP_DATA/lib" "$APP_DATA/bin" "$APP_DATA/sbin" \
+               "$APP_DATA/share" "$APP_DATA/resources" 2>/dev/null || true
+        # 启动脚本稍后按当前安装器版本重新生成
+        rm -f "$APP_DATA/start.sh" "$APP_DATA/run.sh" "$APP_DATA/login_runner.sh" 2>/dev/null || true
+        ok "旧程序本体已清理，运行期数据已保留"
+    fi
+
 # ---------------------------------------------------------------- 兜底脚本
 #
 # 官方 deb 是标准 Electron 桌面应用包（安装到 /opt/WorkBuddy/），
@@ -298,323 +356,20 @@ else
 #
 # bash 是顺序执行的，函数必须在调用点之前定义，故放在此处。
 
-_write_fallback_scripts() {
-    _dir="$1"
-
-    # --- 定位 app 目录（含 cli/bin/codebuddy 的那一层）---
-    _appdir=""
-    for pat in \
-        "$_dir"/root/opt/apps/* \
-        "$_dir"/opt/apps/* \
-        "$_dir"/root/opt/* \
-        "$_dir"/opt/*; do
-        [ -d "$pat" ] || continue
-        if [ -x "$pat/resources/app.asar.unpacked/cli/bin/codebuddy" ]; then
-            _appdir="$pat"
-            break
-        fi
-    done
-
-    # 兜底：全局搜索该入口文件
-    if [ -z "$_appdir" ]; then
-        _cli=$(find "$_dir" -type f -path '*resources/app.asar.unpacked/cli/bin/codebuddy' \
-               2>/dev/null | head -1)
-        [ -n "$_cli" ] && _appdir="${_cli%/resources/app.asar.unpacked/cli/bin/codebuddy}"
-    fi
-
-    if [ -z "$_appdir" ]; then
-        err "未能在 $_dir 中定位 WorkBuddy CLI 入口"
-        log "（期望路径 */resources/app.asar.unpacked/cli/bin/codebuddy）"
-        log "解包顶层："
-        log "$(ls -la "$_dir" 2>/dev/null)"
-        log "opt 结构："
-        log "$(ls -la "$_dir/opt" 2>/dev/null)"
-        log "root 结构："
-        log "$(ls -la "$_dir/root" 2>/dev/null)"
-        return 1
-    fi
-
-    # Node 运行时目录（若存在则加入 PATH）
-    _nodedir="$_appdir/resources/runtime/node/bin"
-
-    info "定位到 CLI 入口：$_appdir"
-    log "app 目录: $_appdir"
-
-    if [ ! -x "$_nodedir/node" ]; then
-        warn "未找到内置 Node 运行时（$_nodedir/node），将依赖系统 node"
-    fi
-
-    # --- 生成启动脚本 ---
-    #
-    # 逻辑与用户在 1.1 上验证可用的方案一致：
-    #   HOME/TMPDIR 指向安装目录（避免污染系统家目录）
-    #   PATH 加入自带 node
-    #   NODE_OPTIONS 限制 V8 堆预算，配合 cgroup 防止 OOM
-    #
-    # 访问认证（重点）：
-    #   CodeBuddy 网关**没有"首次设置密码"的流程**，它只认"用终端打印的密码登录"，
-    #   或在settings.json 里设 gateway.auth。因此给用户两个选择：
-    #
-    #   AUTH_MODE=password -> 随机生成密码存ACCESS_PASS，入口 url 带 ?password=
-    #   AUTH_MODE=none     -> 不需要密码，打开即用（默认）
-    #
-    #   用 AUTH_MODE 文件控制，用户可随时改并重启，无需重装：
-    #       echo password > $BASE/AUTH_MODE   开启
-    #       echo none     > $BASE/AUTH_MODE   关闭
-    cat >"$_dir/start.sh" <<EOS
-#!/bin/bash
-# WorkBuddy 服务启动脚本（由第三方安装器生成，非官方文件）
-# 使用官方内置 CLI 的网关模式提供服务，无需图形环境。
-
-BASE="\$(cd "\$(dirname "\$0")" && pwd)"
-APPDIR="$_appdir"
-
-# 数据与临时目录就地放置，避免污染系统目录
-export HOME="\$BASE/home"
-export TMPDIR="\$BASE/tmp"
-mkdir -p "\$HOME" "\$TMPDIR"
-
-# ---------------------------------------------------------------------
-# 身份认证 / 登录（重要）
-#
-#   WorkBuddy 网关的网页登录使用腾讯 SSO（copilot.tencent.com）扫码。
-#   流程由网关主动向外轮询腾讯 SSO 完成账号绑定，因此：
-#     - 不需要把网关暴露到公网，也不需要任何反向代理 / 隧道；
-#     - 不依赖 CODEBUDDY_BASE_URL（该变量是模型与 Remote Control 的 API
-#       地址，设置为局域网地址反而会破坏模型调用，切勿设置）。
-#
-#   只要 NAS 能访问外网（copilot.tencent.com、tencent.sso.copilot.tencent.com），
-#   普通用户在 fnOS 门户打开 WorkBuddy 后扫码即可登录并绑定账号，
-#   对话历史将随账号持久化（解决“换窗口历史丢失”问题）。
-#
-#   访问鉴权见下方 AUTH_MODE；写入 $BASE/AUTH_MODE=password 可启用密码。
-# ---------------------------------------------------------------------
-# 使用官方自带的 Node 运行时
-[ -d "$_nodedir" ] && export PATH="$_nodedir:\$PATH"
-
-# ---------------------------------------------------------------------
-# 访问认证
-#
-#   AUTH_MODE=password  启用密码认证，密码见ACCESS_PASS 文件
-#   AUTH_MODE=none      不需要密码，局域网/Tailnet 内可直接访问（默认）
-#
-# 需要密码时切换（重启后生效）：
-#   echo password > \$BASE/AUTH_MODE
-#   cat \$BASE/ACCESS_PASS
-# ---------------------------------------------------------------------
-AUTH_MODE="\$(cat "\$BASE/AUTH_MODE" 2>/dev/null || echo none)"
-
-if [ "\$AUTH_MODE" = "password" ]; then
-    ACCESS_PASS_FILE="\$BASE/ACCESS_PASS"
-    if [ ! -s "\$ACCESS_PASS_FILE" ]; then
-        head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16 > "\$ACCESS_PASS_FILE"
-        chmod 600 "\$ACCESS_PASS_FILE"
-    fi
-    export CODEBUDDY_GATEWAY_AUTH=password
-    export CODEBUDDY_GATEWAY_PASSWORD="\$(cat "\$ACCESS_PASS_FILE")"
-else
-    export CODEBUDDY_GATEWAY_AUTH=none
-fi
-
-# ---------------------------------------------------------------------
-# 内存预算
-#
-# V8 堆上限需按机器实际内存自适应：
-#   2GB 机器（如飞牛 OEC）→ 768MB，避免 V8 把系统内存吃光导致 OOM
-#   8GB 以上            → 1024MB
-#   16GB 以上           → 1536MB
-#
-# Node 自身开销约在堆之外再占 100-200MB，故总占用约为堆上限的 1.3 倍。
-# 取得总内存后按比例推算，可用 MEM_TOTAL_MB 覆盖。
-# ---------------------------------------------------------------------
-_mem_total_mb() {
-    if [ -n "\${MEM_TOTAL_MB:-}" ]; then
-        echo "\${MEM_TOTAL_MB}"; return
-    fi
-    _t=""
-    # 来源1：/proc/meminfo（多数 Linux 可读；字段 \$2 为 MemTotal 的 KB 数）
-    _t=\$(awk '/^MemTotal:/{printf "%d", \$2/1024}' /proc/meminfo 2>/dev/null)
-    # 来源2：free -m（部分精简系统无 /proc/meminfo 时兜底）
-    if [ -z "\$_t" ] && command -v free >/dev/null 2>&1; then
-        _t=\$(free -m 2>/dev/null | awk '/^Mem:/{print \$2}')
-    fi
-    # 来源3：vmstat -s
-    if [ -z "\$_t" ] && command -v vmstat >/dev/null 2>&1; then
-        _t=\$(vmstat -s 2>/dev/null | awk '/total memory/{printf "%d", \$1/1024}')
-    fi
-    # 兜底 + 强制为正整数，避免 [ ] 整数比较报 "integer expression expected"
-    case "\$_t" in ''|*[!0-9]*) _t=1536 ;; esac
-    echo "\$_t"
-}
-
-_total=\$(_mem_total_mb)
-if [ "\$_total" -lt 3072 ]; then
-    HEAP_MB=768
-elif [ "\$_total" -lt 12288 ]; then
-    HEAP_MB=1024
-else
-    HEAP_MB=1536
-fi
-
-export NODE_OPTIONS="--max-old-space-size=\$HEAP_MB"
-echo "WorkBuddy: 机器内存 \${_total}MB，V8 堆上限 \${HEAP_MB}MB"
-
-# ---------------------------------------------------------------------
-# 运行时 bundle 选择（兼容 WB 5.6.x 的新包结构）
-#
-#   WB 5.6.2 起，官方 deb 不再随包提供"完整桌面 bundle"
-#   （resources/app.asar.unpacked/cli/dist/codebuddy.js），
-#   而 CLI 入口默认仍执行 require('../dist/codebuddy')，
-#   直接抛 MODULE_NOT_FOUND 崩溃 —— 表现为应用"装完就打不开"、
-#   在应用中心反复启用/退出（GitHub issue #2 / #4）。
-#
-#   官方为此提供了 CODEBUDDY_FORCE_HEADLESS_BUNDLE 开关，指向随包提供的
-#   cli/dist/codebuddy-headless.js。NAS 网关正是 headless 场景，
-#   且该 bundle 体积更小（12MB vs 20MB），更适合小内存机型。
-#
-#   仅在"完整 bundle 不存在"时才启用；旧版本（如 5.5.6）行为保持不变。
-#   若将来 headless bundle 也改名/移除，则退到 lite-wb bundle。
-# ---------------------------------------------------------------------
-_CLI_DIST="\$APPDIR/resources/app.asar.unpacked/cli/dist"
-if [ ! -f "\$_CLI_DIST/codebuddy.js" ]; then
-    if [ -f "\$_CLI_DIST/codebuddy-headless.js" ]; then
-        export CODEBUDDY_FORCE_HEADLESS_BUNDLE=1
-        echo "WorkBuddy: 检测到新版包结构（无完整 bundle），启用 headless bundle"
-    elif [ -f "\$_CLI_DIST/codebuddy-lite-wb.mjs" ]; then
-        export CODEBUDDY_FORCE_LITE_WB_BUNDLE=1
-        echo "WorkBuddy: 检测到新版包结构，启用 lite-wb bundle"
-    fi
-fi
-
-exec "\$APPDIR/resources/app.asar.unpacked/cli/bin/codebuddy" \\
-    --serve --host 0.0.0.0 --port ${APP_PORT}
-EOS
-    chmod +x "$_dir/start.sh" || return 1
-
-    # 默认不启用密码（开箱即用）；仅在尚未设置时写入，避免覆盖用户已切换的密码模式
-    if [ ! -s "$_dir/AUTH_MODE" ]; then
-        printf 'none\n' >"$_dir/AUTH_MODE"
-    fi
-
-    # --- 生成开机自启用的包装脚本 ---
-    cat >"$_dir/login_runner.sh" <<EOS
-#!/bin/sh
-# WorkBuddy 自启包装脚本（由第三方安装器生成，非官方文件）
-DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-nohup "\$DIR/start.sh" >>"\$DIR/run.log" 2>&1 &
-EOS
-    chmod +x "$_dir/login_runner.sh" || return 1
-
-    # --- 供 fnOS main start 调用的入口 ---
-    ln -sf start.sh "$_dir/run.sh" 2>/dev/null || true
-
-    log "已生成启动脚本"
-    hint "CLI 入口：$_appdir"
-    return 0
-}
-
-# 确保认证相关文件存在
-#
-# 默认 AUTH_MODE=none（无需密码，打开即用）。
-# 用户可随时改为 password 以启用访问认证：
-#     echo password > /vol1/1000/app_workbuddy/AUTH_MODE
-#     cat /vol1/1000/app_workbuddy/ACCESS_PASS
-_ensure_auth_files() {
-    _dir="$1"
-    # 认证模式：默认 none
-    [ -f "$_dir/AUTH_MODE" ] || printf 'none\n' >"$_dir/AUTH_MODE"
-
-    # 若已启用密码但密码文件缺失，补生成一个
-    if [ "$(cat "$_dir/AUTH_MODE" 2>/dev/null || echo none)" = "password" ]; then
-        if [ ! -s "$_dir/ACCESS_PASS" ]; then
-            head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16 \
-                >"$_dir/ACCESS_PASS"
-            chmod 600 "$_dir/ACCESS_PASS"
-            info "已生成访问密码：$(cat "$_dir/ACCESS_PASS")"
-        fi
-    fi
-    return 0
-}
-
-# 写入 fnOS 桌面入口配置
-#
-# 关键点：网关开启了密码认证，iframe 请求若不带凭证会返回空白页/黑屏。
-# 因此 url 必须带上 ?password=<网关密码>。
-#
-# 路径说明（fnOS 实测）：
-#   fpk 内是 app/ui/config，但 fnOS 应用中心解包 app.tgz 后，
-#   ui/ 与 config/ **直接落在应用注册目录顶层**，即：
-#     /usr/local/apps/@appcenter/<appid>/ui/config
-#   不是一个 app/ui/ 子目录。各版本结构可能有差异，故依次探测。
-_write_desktop_entry() {
-    _datadir="$1"
-
-    # 无密码模式（默认）：url 不带参数，打开即用
-    if [ "$(cat "$_datadir/AUTH_MODE" 2>/dev/null || echo none)" != "password" ]; then
-        _pw=""
-    else
-        _pw=$(cat "$_datadir/ACCESS_PASS" 2>/dev/null || echo "")
-    fi
-
-    # 候选位置：应用注册目录优先（fnOS 实际读取处），其次旧结构
-    _cands="
-$APP_DIR/ui/config
-$APP_DIR/app/ui/config
-$_datadir/app/ui/config
-$_datadir/ui/config
-"
-
-    _target=""
-    for c in $_cands; do
-        if [ -d "$(dirname "$c")" ]; then
-            _target="$c"
-            break
-        fi
-    done
-
-    # 都没找到时，在应用注册目录下创建 ui/（首次安装可能如此）
-    if [ -z "$_target" ] && [ -d "$APP_DIR" ]; then
-        mkdir -p "$APP_DIR/ui/images" 2>/dev/null || true
-        if [ -d "$APP_DIR/ui" ]; then
-            _target="$APP_DIR/ui/config"
-        fi
-    fi
-
-    if [ -z "$_target" ]; then
-        warn "未找到桌面入口配置目录，跳过"
-        log "尝试过的路径：$_cands"
-        log "APP_DIR=$APP_DIR是否存在：$([ -d "$APP_DIR" ] && echo yes || echo no)"
-        return 1
-    fi
-
-    cat >"$_target" <<EOC
-{
-    ".url": {
-        "${APP_ID}.main": {
-            "allUsers": false,
-            "control": {
-                "accessPerm": "readonly"
-            },
-            "icon": "images/icon_{0}.png",
-            "port": "${APP_PORT}",
-            "protocol": "http",
-            "title": "WorkBuddy",
-            "type": "iframe",
-            "url": "/${_pw:+?password=${_pw}}"
-        }
-    }
-}
-EOC
-    log "已写入桌面入口配置：$_target"
-    log "url 含网关密码，已带 control.accessPerm"
-    return 0
-}
-
     # ------------------------------------------------------------ 解包
     step "解包到 $APP_DATA"
     mkdir -p "$APP_DATA" || die "创建安装目录失败：$APP_DATA"
     dpkg -x "$TMP_DEB" "$APP_DATA" || die "解包失败，安装包可能已损坏"
     ok "解包完成"
+
+    # ------------------------------------------------------------ 网页界面（web-ui）
+    #
+    # WB 5.6.x 的官方 deb 不再随包提供网关的网页界面，
+    # 网关会退化成占位页（"Web UI is not built"）——
+    # 装完能连上 8090，但网页里只有一段 API 文档说明。
+    # 这里从官方 5.5.6 包中只抽取 web-ui 静态资源补齐（详见 _ensure_web_ui 注释）。
+    step "检查网页界面资源"
+    _ensure_web_ui "$APP_DATA" || true
 
     # ------------------------------------------------------------ 启动脚本
     #
@@ -662,6 +417,18 @@ if [ "${NEED_REFRESH_STARTSH:-0}" = "1" ]; then
     else
         warn "启动脚本刷新失败，将沿用现有脚本；若扫码登录异常请手动重启应用"
     fi
+fi
+
+# ---------------------------------------------------------------- 网页界面自愈
+#
+# 两种场景需要在此补 web-ui：
+#   a) 只升级了安装器、WorkBuddy 本体版本未变（跳过解包），
+#      但旧版本安装时没有 web-ui；
+#   b) 之前补齐失败（如当时网络不通），这次重试。
+# 已存在则直接跳过，故每次安装都会跑一遍，代价极小。
+if [ -d "$APP_DATA" ]; then
+    step "检查网页界面资源"
+    _ensure_web_ui "$APP_DATA" || true
 fi
 
 # ---------------------------------------------------------------- 记录安装器版本

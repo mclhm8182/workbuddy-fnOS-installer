@@ -50,6 +50,37 @@ platform_channel() {
     esac
 }
 
+# ---------------------------------------------------------------- web-ui 补齐
+#
+# 背景（2026-11 实测）：
+#   WB 5.6.2 的官方 deb **不再随包提供网关的网页界面**
+#   （resources/app.asar.unpacked/cli/dist/web-ui/，5.5.6 时存在，13MB/895 个文件）。
+#   网关找不到该目录时会退化成一张占位页：
+#     "CodeBuddy Gateway / Web UI is not built. Use the API endpoints directly..."
+#   —— 即装完能连上、但网页里什么都不是（GitHub issue #6）。
+#
+#   官方没有单独发布 web-ui 构件，CDN 上也没有其它平台包可借，
+#   而唯一带 web-ui 的官方包是 5.5.6（5.6.0 起被移除）。
+#
+# 做法：从 5.5.6 的官方 deb 中**只抽取 web-ui 目录**补进 5.6.x 的安装树。
+#   - web-ui 是纯前端静态资源，与架构无关（实测 x64/arm64 两包内该目录
+#     逐字节相同），故 x64/arm64 共用同一份 donor URL；
+#   - 与 5.6.2 后端的接口兼容性已实测：SPA 调用的 67 个 /api 端点
+#     在 5.5.6 自带后端与 5.6.2 后端上响应**完全一致**（SAME=67 DIFF=0）；
+#   - web-ui 在 deb 的 data.tar 中排第 88 位（很靠前），故用 HTTP Range
+#     只取包头约 96MB 即可抽全，比下满 429MB 少传 ~78%。
+#
+# donor 版本固定为 5.5.6（最后一个带 web-ui 的官方版本）。
+# 该 URL 里的构建号是历史事实，不会变；官方接口只提供最新版，
+# 无法通过接口回溯指定版本，故此处硬编码。
+WEBUI_DONOR_VERSION="5.5.6.38337834"
+WEBUI_DONOR_BUILD="5f969292"
+WEBUI_DONOR_URL="https://download.codebuddy.cn/workbuddy/saas/linux-x64-deb/WorkBuddy-linux-x64-deb-${WEBUI_DONOR_VERSION}-${WEBUI_DONOR_BUILD}.deb"
+# 只需 deb 前缀（实测 84MB 足够覆盖 web-ui 全部条目，取 96MB 留余量）
+WEBUI_RANGE_BYTES=100663296
+# 期望抽出的文件数（5.5.6 实测 895），用于校验完整性
+WEBUI_EXPECT_FILES=895
+
 # ---------------------------------------------------------------- 日志输出
 #
 # fnOS 会收集 TRIM_TEMP_LOGFILE，日志同时写终端与文件。
@@ -202,6 +233,108 @@ human_size() {
     if [ "$_b" -ge 1048576 ] 2>/dev/null; then echo "$(( _b / 1048576 ))MB"
     elif [ "$_b" -ge 1024 ] 2>/dev/null; then echo "$(( _b / 1024 ))KB"
     else echo "${_b}B"; fi
+}
+
+# ---------------------------------------------------------------- web-ui 补齐实现
+#
+# 判定：安装树里是否已有可用的网页界面
+web_ui_present() {
+    [ -f "$1/index.html" ]
+}
+
+# 从官方 5.5.6 deb 中抽取 web-ui 目录
+#
+# $1 = 目标 web-ui 目录（会被清空后重建）
+# $2 = 工作目录（存放下载的 deb 前缀）
+#
+# 流程：
+#   1) HTTP Range 取 deb 前缀（CDN 支持 accept-ranges: bytes）
+#   2) ar 取出 data.tar.xz —— 注意：前缀文件不是完整 ar，GNU ar 会报
+#      "不是有效的归档文件"，但仍会把成员数据写到 stdout，故不能靠退出码判断；
+#   3) xz -dc | tar 解出 web-ui —— xz 在流被截断时报"输入意外结束"，
+#      但已解出的部分完整可用，同样不能靠退出码判断；
+#   4) 用文件数 + index.html 校验结果，不合格则报错退出。
+extract_web_ui() {
+    _dest="$1"
+    _work="$2"
+
+    # ar / xz 是解包 deb 前缀所必需
+    have_cmd ar || { warn "系统缺少 ar，无法补齐网页界面"; return 1; }
+    have_cmd xz || { warn "系统缺少 xz，无法补齐网页界面"; return 1; }
+
+    _prefix="$_work/webui-donor.deb"
+    _stage="$_work/webui-stage"
+
+    rm -rf "$_stage" "$_prefix"
+    mkdir -p "$_stage" || return 1
+
+    # --- 1) 下载前缀 ---
+    info "补齐网页界面：下载官方 ${WEBUI_DONOR_VERSION} 的 web-ui 资源"
+    log "donor URL: $WEBUI_DONOR_URL"
+    log "Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))"
+
+    if have_cmd curl; then
+        curl -fL --connect-timeout 20 --retry 2 \
+             -r "0-$((WEBUI_RANGE_BYTES - 1))" \
+             -o "$_prefix" "$WEBUI_DONOR_URL" \
+            || { warn "web-ui 资源下载失败"; return 1; }
+    elif have_cmd wget; then
+        # wget 用 --header 传 Range
+        wget --timeout=30 --tries=2 \
+             --header="Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))" \
+             -O "$_prefix" "$WEBUI_DONOR_URL" \
+            || { warn "web-ui 资源下载失败"; return 1; }
+    else
+        warn "系统缺少 curl 或 wget，无法补齐网页界面"
+        return 1
+    fi
+
+    [ -s "$_prefix" ] || { warn "web-ui 资源下载为空"; return 1; }
+    log "已下载前缀：$(human_size "$(wc -c <"$_prefix")")"
+
+    # --- 2) 解出 web-ui ---
+    #
+    # ar / xz 在流不完整时都会返回非零，但已解出的数据是好的，
+    # 故这里不判断管道退出码，只看最终文件数与 index.html。
+    ar p "$_prefix" data.tar.xz 2>/dev/null \
+        | xz -dc 2>/dev/null \
+        | tar -x -C "$_stage" --wildcards "*/cli/dist/web-ui/*" 2>/dev/null
+
+    _found=$(find "$_stage" -type d -name web-ui 2>/dev/null | head -1)
+    if [ -z "$_found" ]; then
+        warn "未能从 donor 包中定位 web-ui 目录"
+        return 1
+    fi
+
+    _count=$(find "$_found" -type f 2>/dev/null | wc -l | tr -d ' ')
+    log "抽出的 web-ui 文件数：$_count（期望 ${WEBUI_EXPECT_FILES}）"
+
+    if [ "$_count" -lt 100 ]; then
+        warn "web-ui 文件数异常（$_count），判定为不完整"
+        return 1
+    fi
+    if [ ! -f "$_found/index.html" ]; then
+        warn "web-ui 缺少 index.html，判定为不完整"
+        return 1
+    fi
+
+    # --- 3) 落到目标位置 ---
+    rm -rf "$_dest"
+    mkdir -p "$_dest" || return 1
+    cp -a "$_found/." "$_dest/" || return 1
+    chmod -R u+rwX,go+rX "$_dest" 2>/dev/null || true
+
+    _final=$(find "$_dest" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ ! -f "$_dest/index.html" ] || [ "$_final" -lt 100 ]; then
+        warn "web-ui 落地后校验失败（$_final 个文件）"
+        return 1
+    fi
+
+    ok "网页界面资源就绪（$_final 个文件）"
+    log "web-ui 安装位置: $_dest"
+
+    rm -rf "$_stage" "$_prefix"
+    return 0
 }
 
 rand_suffix() {
