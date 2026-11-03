@@ -57,7 +57,7 @@ platform_channel() {
 #   （resources/app.asar.unpacked/cli/dist/web-ui/，5.5.6 时存在，13MB/895 个文件）。
 #   网关找不到该目录时会退化成一张占位页：
 #     "CodeBuddy Gateway / Web UI is not built. Use the API endpoints directly..."
-#   —— 即装完能连上、但网页里什么都不是（GitHub issue #6）。
+#   —— 即装完能连上、但网页里什么都不是（用户反馈，暂无对应 issue）。
 #
 #   官方没有单独发布 web-ui 构件，CDN 上也没有其它平台包可借，
 #   而唯一带 web-ui 的官方包是 5.5.6（5.6.0 起被移除）。

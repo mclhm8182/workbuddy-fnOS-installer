@@ -253,7 +253,7 @@ EOS
 #   网关找不到它时会退化成占位页：
 #     "CodeBuddy Gateway — Web UI is not built. Use the API endpoints directly"
 #   表现为：装完能连上 8090，但网页里只有一段 API 文档说明，什么都点不了。
-#   （GitHub issue #6）
+#   （用户反馈，暂无对应 issue）
 #
 #   5.6.0 起官方就移除了该目录，唯一仍带它的官方版本是 5.5.6。
 #   故从 5.5.6 的官方包中只抽取 web-ui 静态资源补齐。
