@@ -13,16 +13,28 @@
 
 | 架构 | 安装包 |
 | --- | --- |
-| x86_64 | `fnwb.workbuddy_1.2.4_x86.fpk` |
-| ARM64 / aarch64 | `fnwb.workbuddy_1.2.4_arm.fpk` |
+| x86_64 | `fnwb.workbuddy_1.2.6_x86.fpk` |
+| ARM64 / aarch64 | `fnwb.workbuddy_1.2.6_arm.fpk` |
 
 对照 Release 的 `SHA256SUMS` 校验文件，不一致时重新下载：
 
 ```bash
-sha256sum fnwb.workbuddy_1.2.4_x86.fpk
+sha256sum fnwb.workbuddy_1.2.6_x86.fpk
 ```
 
-应用详情显示 `v1.2`，应用内显示完整版本 `v1.2.4`。各版本更新说明见 [GitHub Releases](https://github.com/mclhm8182/workbuddy-fnOS-installer/releases/latest) 附带的说明。
+应用详情显示 `v1.2`，应用内显示完整版本 `v1.2.6`。各版本更新说明见 [GitHub Releases](https://github.com/mclhm8182/workbuddy-fnOS-installer/releases/latest) 附带的说明。
+
+## 1.2.6 更新了什么
+
+WorkBuddy 官方在 5.6.2 上调整了 Linux 包结构，1.2.4 装出来的新版本会连着踩两道坎，本版一并解决：
+
+- **装完打不开**：官方 deb 不再随包提供完整 bundle，CLI 启动即崩溃 → 自动启用官方 headless bundle 开关（旧版本行为不变）。
+- **装完能打开、网页却是占位页**（"Web UI is not built"）：官方自 5.6.0 起不再随包提供网页界面 `cli/dist/web-ui/` → 安装器自动从官方 5.5.6 包中只抽取该目录补齐（只取包头约 96MB，比下满 429MB 少传约 78%）。
+- **升级必然失败**：此前只要安装目录非空就中止 → 现支持直接覆盖升级，并保留登录态与密码设置。
+- 修复应用中心一直转圈（启动改用 `setsid` 脱离启动会话，端口检测增加 `netstat` / `/proc/net/tcp` 回退）。
+- 修正 `build.sh` 中 `curl --retry2` 参数笔误。
+
+本版是 1.2.4 之后的首次发布（1.2.5 未单独发布），更新内容以 [Release 说明](https://github.com/mclhm8182/workbuddy-fnOS-installer/releases/tag/v1.2.6) 为准。
 
 ## 快速开始
 
@@ -79,7 +91,7 @@ sudo tail -40 /vol1/1000/app_workbuddy/run.log     # 服务运行日志
 
 | | x86_64 | aarch64 |
 | --- | --- | --- |
-| 安装包 | `fnwb.workbuddy_1.2.4_x86.fpk` | `fnwb.workbuddy_1.2.4_arm.fpk` |
+| 安装包 | `fnwb.workbuddy_1.2.6_x86.fpk` | `fnwb.workbuddy_1.2.6_arm.fpk` |
 | NAS 机型 | 多数 Intel / AMD 飞牛 | 飞牛 OEC 等 ARM 机型 |
 | 解包后占用 | 约 950 MB | 约 2.7 GB |
 
@@ -107,7 +119,7 @@ cd workbuddy-fnOS-installer
 ./build.sh
 ```
 
-产物在 `dist/`：`fnwb.workbuddy_1.2.4_x86.fpk`、`fnwb.workbuddy_1.2.4_arm.fpk`、`SHA256SUMS`。`build.sh` 自动从 fnOS 官方 CDN 获取 fnpack 1.2.3。
+产物在 `dist/`：`fnwb.workbuddy_1.2.6_x86.fpk`、`fnwb.workbuddy_1.2.6_arm.fpk`、`SHA256SUMS`。`build.sh` 自动从 fnOS 官方 CDN 获取 fnpack 1.2.3。
 
 ## 合规与许可
 

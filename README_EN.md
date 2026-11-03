@@ -13,16 +13,28 @@ Download the package for your architecture from [GitHub Releases](https://github
 
 | Architecture | Package |
 | --- | --- |
-| x86_64 | `fnwb.workbuddy_1.2.4_x86.fpk` |
-| ARM64 / aarch64 | `fnwb.workbuddy_1.2.4_arm.fpk` |
+| x86_64 | `fnwb.workbuddy_1.2.6_x86.fpk` |
+| ARM64 / aarch64 | `fnwb.workbuddy_1.2.6_arm.fpk` |
 
 Verify against the `SHA256SUMS` file included in the Release; re-download if it doesn't match:
 
 ```bash
-sha256sum fnwb.workbuddy_1.2.4_x86.fpk
+sha256sum fnwb.workbuddy_1.2.6_x86.fpk
 ```
 
-The App Center shows `v1.2`; inside the app the full version `v1.2.4` is displayed. Release notes for each version are in the [GitHub Releases](https://github.com/mclhm8182/workbuddy-fnOS-installer/releases/latest) description.
+The App Center shows `v1.2`; inside the app the full version `v1.2.6` is displayed. Release notes for each version are in the [GitHub Releases](https://github.com/mclhm8182/workbuddy-fnOS-installer/releases/latest) description.
+
+## What's new in 1.2.6
+
+WorkBuddy restructured its Linux package in 5.6.2, so a 1.2.4 install ran into two separate walls. This release fixes both:
+
+- **Installs but won't run**: the official deb no longer ships the full bundle, so the CLI crashes on startup → the installer now enables the official headless bundle switch (older WorkBuddy versions behave exactly as before).
+- **Opens fine, but the web UI is just a placeholder** ("Web UI is not built"): since 5.6.0 the official package no longer ships the web interface `cli/dist/web-ui/` → the installer now extracts just that directory from the official 5.5.6 package (fetching only the first ~96 MB of it, about 78 % less traffic than the full 429 MB).
+- **Every upgrade used to fail**: the installer aborted whenever the install directory was non-empty → it now upgrades in place and preserves your login state and password settings.
+- Fixes the app center spinning forever (the service is started with `setsid` to survive fnOS's start session, and port detection falls back to `netstat` / `/proc/net/tcp`).
+- Fixes the `curl --retry2` typo in `build.sh`.
+
+This is the first release since 1.2.4 (1.2.5 was never published separately); see the [release notes](https://github.com/mclhm8182/workbuddy-fnOS-installer/releases/tag/v1.2.6) for the full list.
 
 ## Quick start
 
@@ -79,7 +91,7 @@ sudo tail -40 /vol1/1000/app_workbuddy/run.log     # service runtime log
 
 | | x86_64 | aarch64 |
 | --- | --- | --- |
-| Package | `fnwb.workbuddy_1.2.4_x86.fpk` | `fnwb.workbuddy_1.2.4_arm.fpk` |
+| Package | `fnwb.workbuddy_1.2.6_x86.fpk` | `fnwb.workbuddy_1.2.6_arm.fpk` |
 | NAS models | Most Intel / AMD fnOS devices | ARM models such as fnOS OEC |
 | Unpacked size | ~950 MB | ~2.7 GB |
 
@@ -107,7 +119,7 @@ cd workbuddy-fnOS-installer
 ./build.sh
 ```
 
-Artifacts land in `dist/`: `fnwb.workbuddy_1.2.4_x86.fpk`, `fnwb.workbuddy_1.2.4_arm.fpk`, `SHA256SUMS`. `build.sh` automatically fetches fnpack 1.2.3 from fnOS's official CDN.
+Artifacts land in `dist/`: `fnwb.workbuddy_1.2.6_x86.fpk`, `fnwb.workbuddy_1.2.6_arm.fpk`, `SHA256SUMS`. `build.sh` automatically fetches fnpack 1.2.3 from fnOS's official CDN.
 
 ## Compliance & license
 
