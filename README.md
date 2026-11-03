@@ -21,9 +21,6 @@
 ```bash
 sha256sum fnwb.workbuddy_1.2.6_x86.fpk
 ```
-
-应用详情显示 `v1.2`，应用内显示完整版本 `v1.2.6`。各版本更新说明见 [GitHub Releases](https://github.com/mclhm8182/workbuddy-fnOS-installer/releases/latest) 附带的说明。
-
 ## 快速开始
 
 1. 在 fnOS“应用中心”点击 **手动安装**。
