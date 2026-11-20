@@ -31,8 +31,26 @@ APP_DATA="${WORKBUDDY_APP_DIR:-/vol1/1000/app_workbuddy}"
 # 安装期日志目录（由 fnOS 注入 TRIM_TEMP_LOGFILE 时优先用它）
 LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/workbuddy-installer.log}"
 
-# 服务端口，与 app/ui/config 中的 port 保持一致
+# 服务端口默认值；实际值可由实例配置覆盖（见下）
 APP_PORT="8090"
+
+# ---------------------------------------------------------------- 实例配置
+#
+# $APP_DATA/instance.conf —— 用户/安装期指定的运行参数，**重装与升级都不覆盖**，
+# 这是"定制能跟着官方更新活下来"的关键：生成的脚本可以被安装器重写，
+# 但这里的内容不会丢。
+#
+# 格式（KEY=VALUE 一行一个，# 为注释）：
+#   PORT=8091
+#   WORKSPACE=/vol1/1000/myproject
+#
+# 本文件只解析 PORT（脚本内所有端口判断都要用它）；WORKSPACE 由 start.sh 读取。
+INSTANCE_CONF="$APP_DATA/instance.conf"
+if [ -r "$INSTANCE_CONF" ]; then
+    _conf_port=$(sed -n 's/^[[:space:]]*PORT[[:space:]]*=[[:space:]]*//p' "$INSTANCE_CONF" 2>/dev/null \
+                 | head -1 | tr -dc '0-9')
+    [ -n "$_conf_port" ] && APP_PORT="$_conf_port"
+fi
 
 # ---------------------------------------------------------------- 下载源
 #
@@ -182,6 +200,57 @@ port_listening() {
         FNR>1 { split($2, a, ":"); if (a[2] == want && $4 == "0A") found = 1 }
         END { exit(found ? 0 : 1) }
     ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+# 指定端口的占用进程（port_owner 只认 $APP_PORT）
+port_owner_of() {
+    _pp="$1"
+    if have_cmd ss >/dev/null 2>&1; then
+        ss -lntp 2>/dev/null | grep ":${_pp}[[:space:]]" \
+            | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    elif have_cmd netstat >/dev/null 2>&1; then
+        netstat -lntp 2>/dev/null | grep ":${_pp}[[:space:]]" \
+            | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    else
+        return 1
+    fi
+}
+
+# 占用 $1 端口的进程是否属于本安装目录
+#
+# 三种判据任一成立即可（任一单独使用都会误判）：
+#   1) PID 等于 $APP_DATA/service.pid 记录的值（cmd/main 写的）
+#   2) 该进程 cwd 在 $APP_DATA 之下（start.sh 会 cd 到 workspace）
+#   3) cmdline 里出现 $APP_DATA（node 直接跑 CLI 的场景）
+# 反面教材：只看 cmdline 时，包装脚本 exec 成别的二进制就会被判成"别人的进程"。
+port_owned_by_app() {
+    _opid=$(port_owner_of "$1")
+    [ -n "$_opid" ] || return 1
+
+    _pidfile="$APP_DATA/service.pid"
+    if [ -f "$_pidfile" ]; then
+        _spid=$(tr -dc '0-9' <"$_pidfile" 2>/dev/null)
+        [ -n "$_spid" ] && [ "$_spid" = "$_opid" ] && return 0
+    fi
+
+    _ocwd=$(readlink "/proc/$_opid/cwd" 2>/dev/null || true)
+    case "$_ocwd" in
+        "$APP_DATA"|"$APP_DATA"/*) return 0 ;;
+    esac
+
+    tr '\0' ' ' <"/proc/$_opid/cmdline" 2>/dev/null | grep -q "$APP_DATA" && return 0
+    return 1
+}
+
+# 从 $1 起找第一个没在监听的端口，上限 $2（默认 8199）
+pick_free_port() {
+    _sp="${1:-8090}"
+    _ep="${2:-8199}"
+    while [ "$_sp" -le "$_ep" ]; do
+        port_listening "$_sp" || { printf '%s' "$_sp"; return 0; }
+        _sp=$((_sp + 1))
+    done
+    return 1
 }
 
 is_running() {

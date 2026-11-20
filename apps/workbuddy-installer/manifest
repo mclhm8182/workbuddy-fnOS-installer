@@ -1,5 +1,5 @@
 appname = fnwb.workbuddy
-version = 1.2.6
+version = 1.2.7
 display_name = WorkBuddy
 desc = WorkBuddy 的第三方安装器。安装时从官方地址获取官方 .deb 并解包为 fnOS 应用，不包含 WorkBuddy 任何二进制。本工具与 WorkBuddy 官方无隶属关系。
 platform = x86
@@ -9,10 +9,10 @@ maintainer_url = https://github.com/mclhm8182/workbuddy-fnOS-installer
 distributor = workbuddy-fnOS-installer Contributors
 distributor_url = https://github.com/mclhm8182/workbuddy-fnOS-installer
 service_port = 8090
-checkport = true
+checkport = false
 os_min_version = 1.1.3100
 desktop_uidir = ui
 desktop_applaunchname = fnwb.workbuddy.main
 install_type = root
 ctl_stop = true
-changelog = 修复 WB 5.6.x 装好后网页端只有一段 API 文档占位页、点不动：官方新 deb 起不再随包提供网关的网页界面静态资源 cli/dist/web-ui/，网关找不到该目录即退化为占位页（"Web UI is not built"），表现为 8090 能连上但网页里没有任何可操作界面；现由安装器自动检测并在缺失时从官方 5.5.6 包中只抽取 web-ui 目录补齐（web-ui 在 data.tar 中排第 88 位，用 HTTP Range 只取包头约 96MB 即可抽全，比下满 429MB 少传约 78%，实测 10 秒完成），并以文件数与 index.html 校验完整性；已实测 5.5.6 的 web-ui 与 5.6.2 后端完全兼容（SPA 调用的 67 个 /api 端点响应逐条一致），且 x64/arm64 两包内该目录逐字节相同故两架构共用同一源。同时沿用 1.2.5 的 bundle 兼容修复（CODEBUDDY_FORCE_HEADLESS_BUNDLE）、setsid 启动修正与 build.sh 的 curl --retry 2 笔误修正。
+changelog = 支持安装时指定工作区与端口：安装前在 /vol1/1000/app_workbuddy.install.conf 里写 WORKSPACE=/path 与 PORT=8092（也支持环境变量 WORKBUDDY_WORKSPACE/WORKBUDDY_PORT），安装时即生效；解析结果落入 $APP_DATA/instance.conf，该文件重装与升级都不覆盖，所以安装时定的工作区/端口会被后续官方更新继承。端口改为自动检测：未指定时 8090 空闲则用 8090，被其它进程占用则自动向后挑选空闲端口并提示，被本应用占用（升级场景）则沿用；显式指定的端口若被占用会明确报错并给出改法，而不是静默改动。manifest 的 checkport 关闭，避免 8090 被占用导致整个安装被应用中心拦下。安装结尾与桌面入口都按最终端口生成。同时修复：缺 ar（binutils）时改用 dpkg-deb 解完整包补齐 web-ui，不再静默退化为占位页；生成的 start.sh 固定工作区，避免把 / 当 workspace 递归扫描整盘导致网页无响应。
