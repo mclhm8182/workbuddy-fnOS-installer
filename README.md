@@ -47,6 +47,22 @@ sudo sh -c 'cd /vol1/1000/app_workbuddy && setsid ./start.sh > run.log 2>&1 < /d
 
 **登录与历史**：打开后点击登录，用手机 App 扫码绑定 CodeBuddy 账号即可。绑定后对话历史随账号持久化，**跨窗口 / 设备不丢失**。该登录不依赖公网回跳，NAS 能出网即可完成。
 
+## 工作目录（workspace）
+
+网关把**进程的工作目录**当作 workspace：网页打开时会据 workspace 建文件监听、跑 git status 与 file-changes checkpoint 扫描。若这个目录是 `/` 或包含超大目录（fnOS 的 `/fs/<uid>` 媒体库、云盘 FUSE 挂载等），扫描会同步阻塞事件循环 —— 端口仍在 LISTEN、TCP 能连上，但**页面永久无响应**。
+
+安装器生成的 `start.sh` 因此把 cwd 固定到 `$APP_DATA/home/workspace`（小而干净）。需要让 Agent 直接读写某个项目目录时，按优先级从高到低：
+
+```bash
+# 1) 环境变量（临时）
+WORKBUDDY_WORKSPACE=/vol1/1000/myproject ./start.sh
+
+# 2) 配置文件（推荐，写在程序数据目录，升级/重装不会被覆盖）
+echo /vol1/1000/myproject > /vol1/1000/app_workbuddy/WORKSPACE_DIR
+```
+
+改完重启应用生效。`/` 会被拒绝并回退到默认目录。
+
 ## 卸载
 
 在应用中心直接卸载即可 —— 默认保留程序数据（`/vol1/1000/app_workbuddy`），便于重新启用。彻底清理（不可逆）：
@@ -67,6 +83,8 @@ sudo tail -40 /vol1/1000/app_workbuddy/run.log     # 服务运行日志
 ```
 
 **“8090 端口被占用”**：停掉占用进程，或改 `cmd/lib/common.sh` 的 `APP_PORT` 与 `manifest` 的 `service_port`。
+
+**“系统缺少 ar”**：安装器有两条解包路径 —— 有 `ar` 时只取官方包前缀约 96MB；没有 `ar`（fnOS 精简系统默认不装 `binutils`）时自动改用 `dpkg-deb` 解完整包（多下约 330MB）。两条路径最终校验一致（895 个文件 + `index.html`）。若两条都不可用才会退化为占位页，此时 `apt-get install -y binutils` 后重装一次即可。
 
 **下载失败**：先在电脑下载官方 deb 拷到 NAS，再设 `DEB_FILE=/tmp/wb.deb` 后于应用中心重新安装（绕过官方接口查询）。
 

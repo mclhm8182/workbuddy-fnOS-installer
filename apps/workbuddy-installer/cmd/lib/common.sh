@@ -258,47 +258,81 @@ extract_web_ui() {
     _dest="$1"
     _work="$2"
 
-    # ar / xz 是解包 deb 前缀所必需
-    have_cmd ar || { warn "系统缺少 ar，无法补齐网页界面"; return 1; }
-    have_cmd xz || { warn "系统缺少 xz，无法补齐网页界面"; return 1; }
-
     _prefix="$_work/webui-donor.deb"
+    _full="$_work/webui-donor-full.deb"
     _stage="$_work/webui-stage"
 
-    rm -rf "$_stage" "$_prefix"
+    # 解包 deb 有两条路：
+    #   prefix —— 有 ar 时只取包头 96MB（省流量，默认路径）
+    #   full   —— 没有 ar 时（fnOS 等精简系统默认不装 binutils，实测如此）
+    #             改用系统必然存在的 dpkg-deb 解完整包（多下约 330MB）
+    if have_cmd ar && have_cmd xz; then
+        _mode="prefix"
+    elif have_cmd dpkg-deb && have_cmd xz; then
+        _mode="full"
+        warn "系统缺少 ar（binutils），改用 dpkg-deb 解完整包，下载量约 429MB"
+    else
+        warn "系统缺少 ar 与 dpkg-deb（或 xz），无法补齐网页界面"
+        return 1
+    fi
+
+    rm -rf "$_stage" "$_prefix" "$_full"
     mkdir -p "$_stage" || return 1
 
-    # --- 1) 下载前缀 ---
-    info "补齐网页界面：下载官方 ${WEBUI_DONOR_VERSION} 的 web-ui 资源"
+    # --- 1) 下载 ---
+    if [ "$_mode" = "prefix" ]; then
+        _out="$_prefix"
+        info "补齐网页界面：下载官方 ${WEBUI_DONOR_VERSION} 的 web-ui 资源（前缀 96MB）"
+        log "Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))"
+    else
+        _out="$_full"
+        info "补齐网页界面：下载官方 ${WEBUI_DONOR_VERSION} 完整包"
+    fi
     log "donor URL: $WEBUI_DONOR_URL"
-    log "Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))"
 
     if have_cmd curl; then
-        curl -fL --connect-timeout 20 --retry 2 \
-             -r "0-$((WEBUI_RANGE_BYTES - 1))" \
-             -o "$_prefix" "$WEBUI_DONOR_URL" \
-            || { warn "web-ui 资源下载失败"; return 1; }
+        if [ "$_mode" = "prefix" ]; then
+            curl -fL --connect-timeout 20 --retry 2 \
+                 -r "0-$((WEBUI_RANGE_BYTES - 1))" \
+                 -o "$_out" "$WEBUI_DONOR_URL" \
+                || { warn "web-ui 资源下载失败"; return 1; }
+        else
+            curl -fL --connect-timeout 20 --retry 2 \
+                 -o "$_out" "$WEBUI_DONOR_URL" \
+                || { warn "web-ui 资源下载失败"; return 1; }
+        fi
     elif have_cmd wget; then
-        # wget 用 --header 传 Range
-        wget --timeout=30 --tries=2 \
-             --header="Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))" \
-             -O "$_prefix" "$WEBUI_DONOR_URL" \
-            || { warn "web-ui 资源下载失败"; return 1; }
+        if [ "$_mode" = "prefix" ]; then
+            # wget 用 --header 传 Range
+            wget --timeout=30 --tries=2 \
+                 --header="Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))" \
+                 -O "$_out" "$WEBUI_DONOR_URL" \
+                || { warn "web-ui 资源下载失败"; return 1; }
+        else
+            wget --timeout=30 --tries=2 -O "$_out" "$WEBUI_DONOR_URL" \
+                || { warn "web-ui 资源下载失败"; return 1; }
+        fi
     else
         warn "系统缺少 curl 或 wget，无法补齐网页界面"
         return 1
     fi
 
-    [ -s "$_prefix" ] || { warn "web-ui 资源下载为空"; return 1; }
-    log "已下载前缀：$(human_size "$(wc -c <"$_prefix")")"
+    [ -s "$_out" ] || { warn "web-ui 资源下载为空"; return 1; }
+    log "已下载：$(human_size "$(wc -c <"$_out")")"
 
     # --- 2) 解出 web-ui ---
-    #
-    # ar / xz 在流不完整时都会返回非零，但已解出的数据是好的，
-    # 故这里不判断管道退出码，只看最终文件数与 index.html。
-    ar p "$_prefix" data.tar.xz 2>/dev/null \
-        | xz -dc 2>/dev/null \
-        | tar -x -C "$_stage" --wildcards "*/cli/dist/web-ui/*" 2>/dev/null
+    if [ "$_mode" = "prefix" ]; then
+        # ar / xz 在流不完整时都会返回非零，但已解出的数据是好的，
+        # 故这里不判断管道退出码，只看最终文件数与 index.html。
+        ar p "$_prefix" data.tar.xz 2>/dev/null \
+            | xz -dc 2>/dev/null \
+            | tar -x -C "$_stage" --wildcards "*/cli/dist/web-ui/*" 2>/dev/null
+    else
+        # dpkg-deb 只解文件系统内容，不跑 postinst，安全
+        dpkg-deb -x "$_full" "$_stage" 2>/dev/null \
+            || warn "dpkg-deb 解包返回非零，继续按结果校验"
+        rm -f "$_full"
+    fi
 
     _found=$(find "$_stage" -type d -name web-ui 2>/dev/null | head -1)
     if [ -z "$_found" ]; then
@@ -333,9 +367,10 @@ extract_web_ui() {
     ok "网页界面资源就绪（$_final 个文件）"
     log "web-ui 安装位置: $_dest"
 
-    rm -rf "$_stage" "$_prefix"
+    rm -rf "$_stage" "$_prefix" "$_full"
     return 0
 }
+
 
 rand_suffix() {
     if have_cmd openssl; then openssl rand -hex 6
