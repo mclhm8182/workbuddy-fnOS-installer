@@ -91,6 +91,48 @@ export TMPDIR="\$BASE/tmp"
 mkdir -p "\$HOME" "\$TMPDIR"
 
 # ---------------------------------------------------------------------
+# 工作目录（workspace）—— 必须受控，否则网页打不开
+#
+# 网关把**进程 cwd** 当作 workspace：网页首屏会按 workspace 建立文件监听、
+# 执行 git status 与 file-changes checkpoint 扫描。若 cwd 是 / 或落在超大
+# 目录（fnOS 的 /fs/<uid> 媒体库、云盘 FUSE 挂载等），该扫描会同步阻塞
+# 事件循环 —— 端口仍在 LISTEN、TCP 能连上，但页面永久无响应。
+# 而 fnOS 应用中心拉起子进程时 cwd 就是 /，故此处必须显式切换目录。
+#
+# 自定义（优先级从高到低）：
+#   1) 环境变量 WORKBUDDY_WORKSPACE=/path/to/dir
+#   2) 文件 \$BASE/WORKSPACE_DIR 的内容（升级/重装不会被覆盖）
+#   3) 默认 \$BASE/home/workspace
+#
+# 例：想让 Agent 直接读写某个项目目录
+#   echo /vol1/1000/myproject > \$BASE/WORKSPACE_DIR
+# ---------------------------------------------------------------------
+# 实例配置：\$BASE/instance.conf（安装期或用户写入，重装/升级不覆盖）
+_INST_CONF="\$BASE/instance.conf"
+_inst_get() {
+    [ -f "\$_INST_CONF" ] || return 0
+    sed -n "s/^[[:space:]]*\$1[[:space:]]*=[[:space:]]*//p" "\$_INST_CONF" 2>/dev/null | head -1
+}
+PORT="\${WORKBUDDY_PORT:-\$(_inst_get PORT)}"
+PORT="\${PORT:-8090}"
+export PORT
+
+_WANT="\${WORKBUDDY_WORKSPACE:-\$(_inst_get WORKSPACE)}"
+[ -n "\$_WANT" ] || _WANT="\$(head -1 "\$BASE/WORKSPACE_DIR" 2>/dev/null)"
+[ -n "\$_WANT" ] || _WANT="\$BASE/home/workspace"
+if [ "\$_WANT" = "/" ]; then
+    echo "WorkBuddy: workspace 不能是 /，回退到默认目录"
+    _WANT="\$BASE/home/workspace"
+fi
+mkdir -p "\$_WANT" 2>/dev/null || _WANT="\$BASE/home/workspace"
+[ -d "\$_WANT" ] || { mkdir -p "\$BASE/home/workspace"; _WANT="\$BASE/home/workspace"; }
+cd "\$_WANT" 2>/dev/null || cd "\$BASE"
+echo "WorkBuddy: workspace=\$_WANT port=\$PORT"
+
+# 记录 PID（exec 会保留 PID），供安装器/应用中心判断"这个端口是不是本应用"
+echo \$\$ > "\$BASE/service.pid" 2>/dev/null || true
+
+# ---------------------------------------------------------------------
 # 身份认证 / 登录（重要）
 #
 #   WorkBuddy 网关的网页登录使用腾讯 SSO（copilot.tencent.com）扫码。
@@ -103,7 +145,7 @@ mkdir -p "\$HOME" "\$TMPDIR"
 #   普通用户在 fnOS 门户打开 WorkBuddy 后扫码即可登录并绑定账号，
 #   对话历史将随账号持久化（解决“换窗口历史丢失”问题）。
 #
-#   访问鉴权见下方 AUTH_MODE；写入 $BASE/AUTH_MODE=password 可启用密码。
+#   访问鉴权见下方 AUTH_MODE；写入 \$BASE/AUTH_MODE=password 可启用密码。
 # ---------------------------------------------------------------------
 # 使用官方自带的 Node 运行时
 [ -d "$_nodedir" ] && export PATH="$_nodedir:\$PATH"
@@ -219,7 +261,7 @@ if [ -f "\$_CLI_DIST/web-ui/index.html" ]; then
 fi
 
 exec "\$APPDIR/resources/app.asar.unpacked/cli/bin/codebuddy" \\
-    --serve --host 0.0.0.0 --port ${APP_PORT}
+    --serve --host 0.0.0.0 --port "\$PORT"
 EOS
     chmod +x "$_dir/start.sh" || return 1
 

@@ -82,6 +82,7 @@ _is_our_install() {
             case "$_e" in
                 home|tmp|opt|usr|etc|lib|bin|sbin|share|var|resources|\
                 AUTH_MODE|ACCESS_PASS|start.sh|login_runner.sh|run.sh|\
+                instance.conf|WORKSPACE_DIR|run.log|service.log|service.pid|\
                 .installed_version|.installer_version|.gateway_pass) ;;
                 *) _unknown="$_unknown $_e" ;;
             esac
@@ -119,6 +120,127 @@ ARCH=$(detect_arch)
 log "deb 架构: $ARCH"
 
 check_deps dpkg awk sed grep df
+
+# ---------------------------------------------------------------- 安装前配置
+#
+# fnOS 应用中心是**非交互安装**（没有输入框），所以「安装时指定」用预置文件：
+#
+#   在下面任一位置放一个 KEY=VALUE 文件，安装时会被读到：
+#     /vol1/1000/app_workbuddy.install.conf        ← 推荐
+#     /tmp/app_workbuddy.install.conf
+#     $WORKBUDDY_INSTALL_CONF 指定的路径
+#
+#   内容示例：
+#     WORKSPACE=/vol1/1000/myproject
+#     PORT=8092
+#
+# 解析结果写入 $APP_DATA/instance.conf。该文件**重装/升级都不覆盖**，
+# 所以安装时定的工作区与端口会被后续每一次官方更新继承下来。
+#
+# 也支持环境变量：WORKBUDDY_WORKSPACE / WORKBUDDY_PORT（优先级最高）。
+
+INSTALL_PRESET=""
+for _c in "${WORKBUDDY_INSTALL_CONF:-}" \
+          "$(dirname "$APP_DATA")/app_workbuddy.install.conf" \
+          "/vol1/1000/app_workbuddy.install.conf" \
+          "/tmp/app_workbuddy.install.conf"; do
+    [ -n "$_c" ] && [ -f "$_c" ] && { INSTALL_PRESET="$_c"; break; }
+done
+
+# 从 KEY=VALUE 文件取一个值
+conf_get() {
+    _key="$1"; _file="${2:-}"
+    [ -n "$_file" ] && [ -r "$_file" ] || return 1
+    sed -n "s/^[[:space:]]*${_key}[[:space:]]*=[[:space:]]*//p" "$_file" 2>/dev/null \
+        | head -1 | sed 's/[[:space:]]*$//'
+}
+
+[ -n "$INSTALL_PRESET" ] && info "读取安装预置文件：$INSTALL_PRESET"
+
+DESIRED_WS="${WORKBUDDY_WORKSPACE:-$(conf_get WORKSPACE "$INSTALL_PRESET" 2>/dev/null || true)}"
+[ -n "$DESIRED_WS" ] || DESIRED_WS="$(conf_get WORKSPACE "$INSTANCE_CONF" 2>/dev/null || true)"
+DESIRED_PORT="${WORKBUDDY_PORT:-$(conf_get PORT "$INSTALL_PRESET" 2>/dev/null || true)}"
+[ -n "$DESIRED_PORT" ] || DESIRED_PORT="$(conf_get PORT "$INSTANCE_CONF" 2>/dev/null || true)"
+
+# ---------------------------------------------------------------- 工作区校验
+WORKSPACE_FINAL=""
+if [ -n "$DESIRED_WS" ]; then
+    case "$DESIRED_WS" in
+        /*) ;;
+        *)  die "工作区必须是绝对路径：$DESIRED_WS" ;;
+    esac
+    if [ "$DESIRED_WS" = "/" ]; then
+        die "工作区不能是 /
+agent 会以整盘为工作区，首屏索引会把网关卡死（827 端口能连但不响应）。"
+    fi
+    mkdir -p "$DESIRED_WS" 2>/dev/null || true
+    if [ -d "$DESIRED_WS" ]; then
+        WORKSPACE_FINAL="$DESIRED_WS"
+        ok "工作区：$WORKSPACE_FINAL"
+    else
+        warn "工作区目录不可用：$DESIRED_WS，将回退默认 $APP_DATA/home/workspace"
+    fi
+fi
+
+# ---------------------------------------------------------------- 端口
+#
+#   1) 显式指定（env / 预置文件 / 已有 instance.conf）→ 就用它；
+#      若被**别的**进程占用则明确报错，不偷偷改用户的选择。
+#   2) 未指定 → 8090 空闲就用 8090；被本应用占用（升级）→ 沿用；
+#      被别人占用 → 自动向后挑一个空闲端口并提示。
+APP_PORT_IS_AUTO=0
+if [ -n "$DESIRED_PORT" ]; then
+    _p=$(printf '%s' "$DESIRED_PORT" | tr -dc '0-9')
+    [ -n "$_p" ] || die "端口非法：$DESIRED_PORT"
+    if port_listening "$_p"; then
+        if port_owned_by_app "$_p"; then
+            info "端口 $_p 由本应用占用（升级场景），沿用"
+        else
+            _own=$(port_owner_of "$_p")
+            die "指定端口 ${_p} 已被其它进程占用（PID ${_own:-未知}）。
+请改端口后重新安装：
+  echo PORT=<其它端口> > /vol1/1000/app_workbuddy.install.conf
+或先停掉占用进程：ss -lntp | grep :${_p}"
+        fi
+    fi
+    APP_PORT="$_p"
+    ok "使用指定端口：$APP_PORT"
+else
+    if ! port_listening 8090; then
+        APP_PORT=8090
+    else
+        if port_owned_by_app 8090; then
+            APP_PORT=8090
+            info "端口 8090 由本应用占用（升级场景），沿用"
+        else
+            _free=$(pick_free_port 8091 8199) || die "8090-8199 段无空闲端口，请在预置文件里指定 PORT"
+            APP_PORT="$_free"
+            APP_PORT_IS_AUTO=1
+            _own=$(port_owner_of 8090)
+            warn "端口 8090 已被其它进程占用（PID ${_own:-未知}），自动改用 ${APP_PORT}"
+            hint "要固定端口：安装后改 ${APP_DATA}/instance.conf 的 PORT 并重启应用"
+        fi
+    fi
+fi
+export APP_PORT
+
+# ---------------------------------------------------------------- 落盘实例配置
+# 保留用户已有的其它项，PORT / WORKSPACE 以本次解析结果为准
+mkdir -p "$APP_DATA" 2>/dev/null || true
+_conf_tmp="$INSTANCE_CONF.tmp.$$"
+if [ -f "$INSTANCE_CONF" ]; then
+    grep -vE '^[[:space:]]*(PORT|WORKSPACE)[[:space:]]*=' "$INSTANCE_CONF" >"$_conf_tmp" 2>/dev/null \
+        || : >"$_conf_tmp"
+else
+    : >"$_conf_tmp"
+fi
+{
+    [ -n "$WORKSPACE_FINAL" ] && echo "WORKSPACE=$WORKSPACE_FINAL"
+    echo "PORT=$APP_PORT"
+} >>"$_conf_tmp"
+mv "$_conf_tmp" "$INSTANCE_CONF" 2>/dev/null || warn "写入 instance.conf 失败"
+chmod 600 "$INSTANCE_CONF" 2>/dev/null || true
+log "instance.conf: PORT=$APP_PORT WORKSPACE=${WORKSPACE_FINAL:-<默认>}"
 
 # ---------------------------------------------------------------- 官方更新接口
 #
@@ -172,7 +294,7 @@ CUR_INSTALLED=$(installed_version || true)
 
 # 安装器（fpk）自身版本：由 build.sh 用 APP_VERSION 注入此字面量。
 # 用于判断“仅升级了安装器、WorkBuddy 本体版本未变”时是否仍需刷新启动脚本。
-INSTALLER_VERSION="1.2.4"
+INSTALLER_VERSION="1.2.7"
 CUR_INSTALLER=$(cat "$APP_DATA/.installer_version" 2>/dev/null | tr -d '[:space:]')
 
 # 标记：跳过本体下载时，是否仍需刷新启动脚本（安装器版本变化时才置 1）
@@ -492,7 +614,7 @@ then
     else
         cmdline=""
     fi
-    if echo "$cmdline" | grep -q "$APP_DATA"; then
+    if port_owned_by_app "$APP_PORT"; then
         ok "WorkBuddy 已运行：端口 ${APP_PORT}（PID $pid）"
         log "=== 安装成功 ==="
     elif [ -n "$pid" ]; then
@@ -510,6 +632,8 @@ else
 fi
 
 log "安装目录: $APP_DATA"
+log "工作区: ${WORKSPACE_FINAL:-$APP_DATA/home/workspace（默认）}"
+log "端口: ${APP_PORT}${APP_PORT_IS_AUTO:+（自动选择）}"
 log "访问地址: http://<NAS地址>:${APP_PORT}"
 log "网关密码: $(cat "$APP_DATA/.gateway_pass" 2>/dev/null || echo '(见 .gateway_pass)')"
 
@@ -521,6 +645,7 @@ $(ok "WorkBuddy 安装完成")
 
   访问地址：http://<你的NAS地址>:${APP_PORT}
   程序目录：$APP_DATA
+  工作区　：${WORKSPACE_FINAL:-$APP_DATA/home/workspace}
   访问密码：$(cat "$APP_DATA/.gateway_pass" 2>/dev/null || echo '见 .gateway_pass')
 
   桌面图标已自动配置好密码，直接点击即可访问。

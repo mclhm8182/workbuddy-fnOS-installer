@@ -31,8 +31,26 @@ APP_DATA="${WORKBUDDY_APP_DIR:-/vol1/1000/app_workbuddy}"
 # 安装期日志目录（由 fnOS 注入 TRIM_TEMP_LOGFILE 时优先用它）
 LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/workbuddy-installer.log}"
 
-# 服务端口，与 app/ui/config 中的 port 保持一致
+# 服务端口默认值；实际值可由实例配置覆盖（见下）
 APP_PORT="8090"
+
+# ---------------------------------------------------------------- 实例配置
+#
+# $APP_DATA/instance.conf —— 用户/安装期指定的运行参数，**重装与升级都不覆盖**，
+# 这是"定制能跟着官方更新活下来"的关键：生成的脚本可以被安装器重写，
+# 但这里的内容不会丢。
+#
+# 格式（KEY=VALUE 一行一个，# 为注释）：
+#   PORT=8091
+#   WORKSPACE=/vol1/1000/myproject
+#
+# 本文件只解析 PORT（脚本内所有端口判断都要用它）；WORKSPACE 由 start.sh 读取。
+INSTANCE_CONF="$APP_DATA/instance.conf"
+if [ -r "$INSTANCE_CONF" ]; then
+    _conf_port=$(sed -n 's/^[[:space:]]*PORT[[:space:]]*=[[:space:]]*//p' "$INSTANCE_CONF" 2>/dev/null \
+                 | head -1 | tr -dc '0-9')
+    [ -n "$_conf_port" ] && APP_PORT="$_conf_port"
+fi
 
 # ---------------------------------------------------------------- 下载源
 #
@@ -184,6 +202,57 @@ port_listening() {
     ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
+# 指定端口的占用进程（port_owner 只认 $APP_PORT）
+port_owner_of() {
+    _pp="$1"
+    if have_cmd ss >/dev/null 2>&1; then
+        ss -lntp 2>/dev/null | grep ":${_pp}[[:space:]]" \
+            | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    elif have_cmd netstat >/dev/null 2>&1; then
+        netstat -lntp 2>/dev/null | grep ":${_pp}[[:space:]]" \
+            | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+    else
+        return 1
+    fi
+}
+
+# 占用 $1 端口的进程是否属于本安装目录
+#
+# 三种判据任一成立即可（任一单独使用都会误判）：
+#   1) PID 等于 $APP_DATA/service.pid 记录的值（cmd/main 写的）
+#   2) 该进程 cwd 在 $APP_DATA 之下（start.sh 会 cd 到 workspace）
+#   3) cmdline 里出现 $APP_DATA（node 直接跑 CLI 的场景）
+# 反面教材：只看 cmdline 时，包装脚本 exec 成别的二进制就会被判成"别人的进程"。
+port_owned_by_app() {
+    _opid=$(port_owner_of "$1")
+    [ -n "$_opid" ] || return 1
+
+    _pidfile="$APP_DATA/service.pid"
+    if [ -f "$_pidfile" ]; then
+        _spid=$(tr -dc '0-9' <"$_pidfile" 2>/dev/null)
+        [ -n "$_spid" ] && [ "$_spid" = "$_opid" ] && return 0
+    fi
+
+    _ocwd=$(readlink "/proc/$_opid/cwd" 2>/dev/null || true)
+    case "$_ocwd" in
+        "$APP_DATA"|"$APP_DATA"/*) return 0 ;;
+    esac
+
+    tr '\0' ' ' <"/proc/$_opid/cmdline" 2>/dev/null | grep -q "$APP_DATA" && return 0
+    return 1
+}
+
+# 从 $1 起找第一个没在监听的端口，上限 $2（默认 8199）
+pick_free_port() {
+    _sp="${1:-8090}"
+    _ep="${2:-8199}"
+    while [ "$_sp" -le "$_ep" ]; do
+        port_listening "$_sp" || { printf '%s' "$_sp"; return 0; }
+        _sp=$((_sp + 1))
+    done
+    return 1
+}
+
 is_running() {
     pid=$(port_owner) || return 1
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
@@ -258,47 +327,81 @@ extract_web_ui() {
     _dest="$1"
     _work="$2"
 
-    # ar / xz 是解包 deb 前缀所必需
-    have_cmd ar || { warn "系统缺少 ar，无法补齐网页界面"; return 1; }
-    have_cmd xz || { warn "系统缺少 xz，无法补齐网页界面"; return 1; }
-
     _prefix="$_work/webui-donor.deb"
+    _full="$_work/webui-donor-full.deb"
     _stage="$_work/webui-stage"
 
-    rm -rf "$_stage" "$_prefix"
+    # 解包 deb 有两条路：
+    #   prefix —— 有 ar 时只取包头 96MB（省流量，默认路径）
+    #   full   —— 没有 ar 时（fnOS 等精简系统默认不装 binutils，实测如此）
+    #             改用系统必然存在的 dpkg-deb 解完整包（多下约 330MB）
+    if have_cmd ar && have_cmd xz; then
+        _mode="prefix"
+    elif have_cmd dpkg-deb && have_cmd xz; then
+        _mode="full"
+        warn "系统缺少 ar（binutils），改用 dpkg-deb 解完整包，下载量约 429MB"
+    else
+        warn "系统缺少 ar 与 dpkg-deb（或 xz），无法补齐网页界面"
+        return 1
+    fi
+
+    rm -rf "$_stage" "$_prefix" "$_full"
     mkdir -p "$_stage" || return 1
 
-    # --- 1) 下载前缀 ---
-    info "补齐网页界面：下载官方 ${WEBUI_DONOR_VERSION} 的 web-ui 资源"
+    # --- 1) 下载 ---
+    if [ "$_mode" = "prefix" ]; then
+        _out="$_prefix"
+        info "补齐网页界面：下载官方 ${WEBUI_DONOR_VERSION} 的 web-ui 资源（前缀 96MB）"
+        log "Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))"
+    else
+        _out="$_full"
+        info "补齐网页界面：下载官方 ${WEBUI_DONOR_VERSION} 完整包"
+    fi
     log "donor URL: $WEBUI_DONOR_URL"
-    log "Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))"
 
     if have_cmd curl; then
-        curl -fL --connect-timeout 20 --retry 2 \
-             -r "0-$((WEBUI_RANGE_BYTES - 1))" \
-             -o "$_prefix" "$WEBUI_DONOR_URL" \
-            || { warn "web-ui 资源下载失败"; return 1; }
+        if [ "$_mode" = "prefix" ]; then
+            curl -fL --connect-timeout 20 --retry 2 \
+                 -r "0-$((WEBUI_RANGE_BYTES - 1))" \
+                 -o "$_out" "$WEBUI_DONOR_URL" \
+                || { warn "web-ui 资源下载失败"; return 1; }
+        else
+            curl -fL --connect-timeout 20 --retry 2 \
+                 -o "$_out" "$WEBUI_DONOR_URL" \
+                || { warn "web-ui 资源下载失败"; return 1; }
+        fi
     elif have_cmd wget; then
-        # wget 用 --header 传 Range
-        wget --timeout=30 --tries=2 \
-             --header="Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))" \
-             -O "$_prefix" "$WEBUI_DONOR_URL" \
-            || { warn "web-ui 资源下载失败"; return 1; }
+        if [ "$_mode" = "prefix" ]; then
+            # wget 用 --header 传 Range
+            wget --timeout=30 --tries=2 \
+                 --header="Range: bytes=0-$((WEBUI_RANGE_BYTES - 1))" \
+                 -O "$_out" "$WEBUI_DONOR_URL" \
+                || { warn "web-ui 资源下载失败"; return 1; }
+        else
+            wget --timeout=30 --tries=2 -O "$_out" "$WEBUI_DONOR_URL" \
+                || { warn "web-ui 资源下载失败"; return 1; }
+        fi
     else
         warn "系统缺少 curl 或 wget，无法补齐网页界面"
         return 1
     fi
 
-    [ -s "$_prefix" ] || { warn "web-ui 资源下载为空"; return 1; }
-    log "已下载前缀：$(human_size "$(wc -c <"$_prefix")")"
+    [ -s "$_out" ] || { warn "web-ui 资源下载为空"; return 1; }
+    log "已下载：$(human_size "$(wc -c <"$_out")")"
 
     # --- 2) 解出 web-ui ---
-    #
-    # ar / xz 在流不完整时都会返回非零，但已解出的数据是好的，
-    # 故这里不判断管道退出码，只看最终文件数与 index.html。
-    ar p "$_prefix" data.tar.xz 2>/dev/null \
-        | xz -dc 2>/dev/null \
-        | tar -x -C "$_stage" --wildcards "*/cli/dist/web-ui/*" 2>/dev/null
+    if [ "$_mode" = "prefix" ]; then
+        # ar / xz 在流不完整时都会返回非零，但已解出的数据是好的，
+        # 故这里不判断管道退出码，只看最终文件数与 index.html。
+        ar p "$_prefix" data.tar.xz 2>/dev/null \
+            | xz -dc 2>/dev/null \
+            | tar -x -C "$_stage" --wildcards "*/cli/dist/web-ui/*" 2>/dev/null
+    else
+        # dpkg-deb 只解文件系统内容，不跑 postinst，安全
+        dpkg-deb -x "$_full" "$_stage" 2>/dev/null \
+            || warn "dpkg-deb 解包返回非零，继续按结果校验"
+        rm -f "$_full"
+    fi
 
     _found=$(find "$_stage" -type d -name web-ui 2>/dev/null | head -1)
     if [ -z "$_found" ]; then
@@ -333,9 +436,10 @@ extract_web_ui() {
     ok "网页界面资源就绪（$_final 个文件）"
     log "web-ui 安装位置: $_dest"
 
-    rm -rf "$_stage" "$_prefix"
+    rm -rf "$_stage" "$_prefix" "$_full"
     return 0
 }
+
 
 rand_suffix() {
     if have_cmd openssl; then openssl rand -hex 6

@@ -47,6 +47,65 @@ sudo sh -c 'cd /vol1/1000/app_workbuddy && setsid ./start.sh > run.log 2>&1 < /d
 
 **登录与历史**：打开后点击登录，用手机 App 扫码绑定 CodeBuddy 账号即可。绑定后对话历史随账号持久化，**跨窗口 / 设备不丢失**。该登录不依赖公网回跳，NAS 能出网即可完成。
 
+## 工作区与端口（可自定义，且能随更新保留）
+
+网关把**进程的工作目录**当作 workspace：网页打开时会据 workspace 建文件监听、跑 git status 与 file-changes checkpoint 扫描。若这个目录是 `/` 或包含超大目录（fnOS 的 `/fs/<uid>` 媒体库、云盘 FUSE 挂载等），扫描会同步阻塞事件循环 —— 端口仍在 LISTEN、TCP 能连上，但**页面永久无响应**。所以工作区必须是一个小而干净的目录。
+
+### 安装时指定（推荐）
+
+fnOS 应用中心是无人值守安装，所以用预置文件。安装前在 NAS 上放一个：
+
+```bash
+# 内容为 KEY=VALUE；下面三个位置任意一个都可识别
+sudo tee /vol1/1000/app_workbuddy.install.conf >/dev/null <<'EOF'
+WORKSPACE=/vol1/1000/myproject
+PORT=8092
+EOF
+```
+
+| 键 | 说明 |
+| --- | --- |
+| `WORKSPACE` | 绝对路径；必须存在或可创建。`/` 会被拒绝（会把网关卡死） |
+| `PORT` | 要用的端口；被**别的**进程占用时安装会明确报错（不会偷偷改你的选择） |
+
+也支持环境变量 `WORKBUDDY_WORKSPACE` / `WORKBUDDY_PORT`（优先级最高），以及 `WORKBUDDY_INSTALL_CONF=<路径>` 指定预置文件。
+
+### 安装后修改
+
+解析结果落在**程序数据目录**的 `instance.conf`：
+
+```bash
+cat /vol1/1000/app_workbuddy/instance.conf
+# WORKSPACE=/vol1/1000/myproject
+# PORT=8092
+
+# 改完重启应用
+sudo bash /var/apps/fnwb.workbuddy/cmd/main stop
+sudo bash /var/apps/fnwb.workbuddy/cmd/main start
+```
+
+这是**升级/重装都不覆盖**的文件，所以安装时定的工作区与端口会一直继承下去 —— 换新版 fpk 只需要重装，不用重新配置。
+
+### 端口自动检测
+
+| 情况 | 行为 |
+| --- | --- |
+| 未指定端口，8090 空闲 | 用 8090 |
+| 未指定端口，8090 被**本应用**占用（升级场景） | 沿用 8090 |
+| 未指定端口，8090 被其它进程占用 | 自动向后找一个空闲端口（8091–8199），日志与安装结尾都会提示 |
+| 指定了端口，但被别的进程占用 | **安装失败**并给出改法（不静默改动） |
+
+`manifest` 的 `checkport` 已关闭，否则 8090 被占用时应用中心会在跑安装脚本前就拦下来。桌面入口的 `ui/config` 会按最终端口写入，点图标不会指错端口。
+
+### 想继续用文件方式指定
+
+也可以继续用 `WORKSPACE_DIR`（只写目录、单行）：优先级低于 `instance.conf`：
+
+```bash
+echo /vol1/1000/myproject > /vol1/1000/app_workbuddy/WORKSPACE_DIR
+```
+
+
 ## 卸载
 
 在应用中心直接卸载即可 —— 默认保留程序数据（`/vol1/1000/app_workbuddy`），便于重新启用。彻底清理（不可逆）：
@@ -66,7 +125,9 @@ sudo tail -40 /var/log/apps/fnwb.workbuddy.log     # 应用日志
 sudo tail -40 /vol1/1000/app_workbuddy/run.log     # 服务运行日志
 ```
 
-**“8090 端口被占用”**：停掉占用进程，或改 `cmd/lib/common.sh` 的 `APP_PORT` 与 `manifest` 的 `service_port`。
+**“端口被占用”**：未指定端口时安装器会自动改用空口并提示实际端口；显式指定（`instance.conf` 的 `PORT`）时若被占用会安装失败并说明改法。要换端口改 `instance.conf` 后重启应用即可，无需重装。
+
+**“系统缺少 ar”**：安装器有两条解包路径 —— 有 `ar` 时只取官方包前缀约 96MB；没有 `ar`（fnOS 精简系统默认不装 `binutils`）时自动改用 `dpkg-deb` 解完整包（多下约 330MB）。两条路径最终校验一致（895 个文件 + `index.html`）。若两条都不可用才会退化为占位页，此时 `apt-get install -y binutils` 后重装一次即可。
 
 **下载失败**：先在电脑下载官方 deb 拷到 NAS，再设 `DEB_FILE=/tmp/wb.deb` 后于应用中心重新安装（绕过官方接口查询）。
 
